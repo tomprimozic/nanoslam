@@ -35,7 +35,7 @@ def inside(img, x, y, border):
   return border <= x < img.shape[1] - 1 - border and border <= y < img.shape[0] - 1 - border
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def sample_normalized(img, x, y, half, out):
   '''(2 half + 1)^2 patch at sub-pixel (x, y), normalized to zero mean / unit variance; False if outside / flat'''
   if not inside(img, x - half, y - half, 0) or not inside(img, x + half, y + half, 0):
@@ -57,7 +57,7 @@ def sample_normalized(img, x, y, half, out):
   return True
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def sample_template(src, us, vs, A, scale_src, scale_tgt, half, T):
   '''
   template of size (2 half + 3)^2 (with a 1 px border for gradients) in target-level pixels: target offset d maps to
@@ -75,12 +75,15 @@ def sample_template(src, us, vs, A, scale_src, scale_tgt, half, T):
   return True
 
 
-@njit(cache=True)
-def align_patches(src_pyr, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, half, max_iter):
+@njit(cache=True, nogil=True)
+def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, half, max_iter, trim=0.0):
   '''
-  src_pyr / tgt_pyr: pyramids (tuples of uint8 images), uv_src: (n, 2) observations in the source keyframe,
-  A: (n, 2, 2) affine warps target -> source (level 0 pixels), uv_guess: (n, 2) initial positions in the target,
-  top_level: coarsest target level, search_px: half-width of the brute-force ZNCC search on the top level (0 = none)
+  src_pyr: pyramids of all source keyframes (a tuple of (n_keyframes, h, w) uint8 arrays, one per level), src_index:
+  (n,) which one each point's patch comes from, tgt_pyr: pyramid of the target image (tuple of (h, w) uint8 arrays),
+  uv_src: (n, 2) observations in the source keyframes, A: (n, 2, 2) affine warps target -> source (level 0 pixels),
+  uv_guess: (n, 2) initial positions in the target, top_level: coarsest target level, search_px: half-width of the
+  brute-force ZNCC search on the top level (0 = none), trim: fraction of the pixels with the largest residuals left out
+  of every LK iteration (robust to the background showing in patches on a depth edge)
   returns uv (n, 2), ncc (n,) (-1 = failed)
   '''
   n = len(uv_src)
@@ -103,7 +106,7 @@ def align_patches(src_pyr, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, h
       # source level whose pixels have about the same size as the target level's (after warping)
       ls = int(np.round(np.log2(max(footprint * scale, 1e-3))))
       ls = min(max(ls, 0), n_src - 1)
-      if not sample_template(src_pyr[ls], uv_src[k, 0], uv_src[k, 1], A[k], 2.0 ** ls, scale, half, T):
+      if not sample_template(src_pyr[ls][src_index[k]], uv_src[k, 0], uv_src[k, 1], A[k], 2.0 ** ls, scale, half, T):
         ok = False
         break
       # normalize the template, gradients of the normalized template, Gauss-Newton Hessian
@@ -150,13 +153,31 @@ def align_patches(src_pyr, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, h
           ok = False
           break
         b0, b1 = 0.0, 0.0
-        for i in range(P):
-          for j in range(P):
-            r = I[i, j] - Tn[i, j]
-            b0 += gx[i, j] * r
-            b1 += gy[i, j] * r
-        dx = (H11 * b0 - H01 * b1) / det
-        dy = (H00 * b1 - H01 * b0) / det
+        if trim > 0:   # robust: leave out the largest residuals (the Hessian has to follow the mask)
+          R = I - Tn
+          thr = np.sort(np.abs(R).ravel())[int((1 - trim) * (P * P - 1))]
+          h00, h01, h11 = 0.0, 0.0, 0.0
+          for i in range(P):
+            for j in range(P):
+              if abs(R[i, j]) <= thr:
+                b0 += gx[i, j] * R[i, j]
+                b1 += gy[i, j] * R[i, j]
+                h00 += gx[i, j] ** 2
+                h01 += gx[i, j] * gy[i, j]
+                h11 += gy[i, j] ** 2
+          d = h00 * h11 - h01 * h01
+          if d < 1e-6 * (h00 + h11) ** 2 or h00 + h11 < 1e-6:
+            h00, h01, h11, d = H00, H01, H11, det
+          dx = (h11 * b0 - h01 * b1) / d
+          dy = (h00 * b1 - h01 * b0) / d
+        else:
+          for i in range(P):
+            for j in range(P):
+              r = I[i, j] - Tn[i, j]
+              b0 += gx[i, j] * r
+              b1 += gy[i, j] * r
+          dx = (H11 * b0 - H01 * b1) / det
+          dy = (H00 * b1 - H01 * b0) / det
         x -= dx
         y -= dy
         if dx * dx + dy * dy < 1e-4:
@@ -178,15 +199,15 @@ def align_patches(src_pyr, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, h
 def affine_warps(K, T_src, T_tgt, X, uv_src, d=4.0):
   '''
   (n, 2, 2) local affine maps from target to source pixels, induced by the plane through each point X (world) that
-  is fronto-parallel in the source keyframe; also returns the projection of X into the target
+  is fronto-parallel in its source keyframe (T_src: (n, 4, 4), one per point); also the projection of X into the target
   '''
   Kinv = np.linalg.inv(K)
-  z = X @ T_src[2, :3] + T_src[2, 3]
+  z = np.einsum('nj,nj->n', T_src[:, 2, :3], X) + T_src[:, 2, 3]
   T_ts = T_tgt @ np.linalg.inv(T_src)
 
   def to_target(uv):
     rays = np.c_[uv, np.ones(len(uv))] @ Kinv.T * z[:, None]
-    p = (rays @ T_ts[:3, :3].T + T_ts[:3, 3]) @ K.T
+    p = (np.einsum('nij,nj->ni', T_ts[:, :3, :3], rays) + T_ts[:, :3, 3]) @ K.T
     return p[:, :2] / p[:, 2:]
 
   u0 = to_target(uv_src)
@@ -196,3 +217,27 @@ def affine_warps(K, T_src, T_tgt, X, uv_src, d=4.0):
   A = np.zeros_like(A_st)
   A[good] = np.linalg.inv(A_st[good])
   return A, u0, good
+
+
+class ImageStore:
+  '''keyframe pyramids in one (capacity, h, w) array per level, so that patch alignment can read from any of them'''
+
+  def __init__(self, pyr):
+    self.levels = tuple(np.zeros((16,) + level.shape, np.uint8) for level in pyr)
+    self.free = []
+    self.n = 0
+
+  def add(self, pyr):
+    '''store a pyramid, returns its slot'''
+    if self.free:
+      slot = self.free.pop()
+    else:
+      if self.n == len(self.levels[0]):
+        self.levels = tuple(np.concatenate([a, np.zeros_like(a)]) for a in self.levels)
+      slot, self.n = self.n, self.n + 1
+    for a, level in zip(self.levels, pyr):
+      a[slot] = level
+    return slot
+
+  def release(self, slot):
+    self.free.append(slot)

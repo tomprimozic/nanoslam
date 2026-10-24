@@ -2,7 +2,9 @@
 python run.py household                                   # one sequence (names: datasets.all_names())
 python run.py household --rerun                           # visualize (--rerun-save x.rrd: record to a file)
 python run.py all --out runs/NAME [--starts 0,7,14]        # all sequences in parallel (+ start-frame ensemble)
-python run.py summary runs/A runs/B                        # compare runs (metrics recomputed from trajectories)
+python run.py summary runs/A runs/B                        # compare runs (metrics recomputed from trajectories;
+                                                           # runs/A1+runs/A2 pools runs, e.g. of two seeds)
+python run.py view runs/A/household@0 ...                  # rerun view of saved runs (alignment, errors over time)
 options: --set name=value ... (override Config), --perturb SEED (scale all numeric parameters by 0.7-1.4x),
          --start S (skip the first S frames), --max-frames N, --only a,b (subset of sequences for 'all')
 '''
@@ -69,13 +71,14 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
     if rr is not None:
       log_rerun(rr, slam, data, start, i, img)
     if not quiet and (i - start) % 500 == 0:
-      print(f'{name} frame {i}: {slam.stats[-1]}', flush=True)
+      print(f'{name} frame {i}: tracks {slam.stats.tracks[-1]} mapped {slam.stats.mapped[-1]} lost {slam.lost}', flush=True)
   slam.finish()
   elapsed = time.perf_counter() - t0
   n = stop - start
-  final, online = slam.trajectory(n)
-  gt = data.gt[start:stop, :3, 3]
-  m_final, m_online = evaluate.evaluate(final, gt), evaluate.evaluate(online, gt)
+  T_final, T_online = slam.poses(n, online=False), slam.poses(n)
+  gt, gt_R = data.gt[start:stop, :3, 3], data.gt[start:stop, :3, :3]
+  m_final = evaluate.evaluate(T_final[:, :3, 3], gt, est_R=T_final[:, :3, :3], gt_R=gt_R)
+  m_online = evaluate.evaluate(T_online[:, :3, 3], gt, est_R=T_online[:, :3, :3], gt_R=gt_R)
   events = {}
   for e in slam.events:
     events[e['type']] = events.get(e['type'], 0) + 1
@@ -90,18 +93,20 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
   }
   if out is not None:
     out.mkdir(parents=True, exist_ok=True)
-    np.savez(out / 'trajectory.npz', final=final, online=online, gt=gt, poses=slam.poses(n), stats=np.array(slam.stats))
+    np.savez(out / 'trajectory.npz', final=T_final[:, :3, 3], online=T_online[:, :3, 3], gt=gt, poses=T_final,
+             online_poses=T_online,
+             **{f'stats_{k}': getattr(slam.stats, k) for k in slam.stats._spec})
     (out / 'metrics.json').write_text(json.dumps(result | {'event_list': slam.events}, indent=1, default=float))
-    evaluate.plot(m_final, gt, out / 'trajectory.png', title=f'{name} (final)')
+    evaluate.plot(m_online, gt, out / 'trajectory.png', title=f'{name} (live)')
   return result
 
 
 def format_result(r):
-  f, o = r['final'], r['online']
-  return (f"{r['name']:32s} drift {f['drift']:7.3f} final {f['final']:7.3f} ate {f['ate']:6.3f} "
-          f"drift% {f.get('drift%', np.inf):5.2f} scale {f.get('scale', np.nan):5.2f} | online drift {o['drift']:7.3f} | "
-          f"tracked {f['tracked']:.2f} kfs {r['keyframes']:4d}/{r['keyframes_created']:4d} {r['fps']:5.1f} fps "
-          f"{' '.join(f'{k}={v}' for k, v in r['events'].items())}")
+  o, f = r['online'], r['final']
+  return (f"{r['name']:32s} final {o['final']:6.3f} rot {o.get('rot', np.nan):5.2f} drift {o['drift']:6.3f} "
+          f"ate {o['ate']:6.3f} scale {o.get('scale', np.nan):5.2f} | hindsight: final {f['final']:6.3f} ate {f['ate']:6.3f} | "
+          f"tracked {o['tracked']:.2f} kfs {r['keyframes']:4d}/{r['keyframes_created']:4d} {r['fps']:5.1f} fps "
+          f"(max {r['latency_ms']['max']:.0f} ms) {' '.join(f'{k}={v}' for k, v in r['events'].items())}")
 
 
 def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None):
@@ -133,21 +138,25 @@ def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None):
     return list(pool.map(launch, [(n, s) for s in starts for n in names]))
 
 
-def summary(run_dirs, metrics=('drift', 'final', 'ate'), trajectory='final'):
+def summary(run_dirs, metrics=('final', 'rot', 'drift', 'ate', 'lost_episodes', 'lost%'), trajectory='online'):
   '''per-sequence table; metrics are recomputed from the saved trajectories (so evaluation changes apply)'''
   rows, gts = {}, {}
   for d in run_dirs:
     runs = {}
-    for f in sorted(Path(d).glob('*/log.txt')):
+    for f in sorted(f for part in d.split('+') for f in Path(part).glob('*/log.txt')):   # A+B: pooled
       name = f.parent.name.split('@')[0]       # NAME@START: the same sequence from another start frame
       if not (f.parent / 'trajectory.npz').exists():
         runs.setdefault(name, []).append(None)
         continue
       if name not in gts:
-        gts[name] = datasets.load(name).gt[:, :3, 3]
+        g = datasets.load(name).gt
+        gts[name] = (g[:, :3, 3], g[:, :3, :3])
       t = np.load(f.parent / 'trajectory.npz')
       r = json.loads((f.parent / 'metrics.json').read_text())
-      runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gts[name][-len(t['final']):])
+      key = 'online_poses' if trajectory == 'online' else 'poses'
+      gt = [x[-len(t['final']):] for x in gts[name]]
+      R = (t[key][:, :3, :3], gt[1]) if key in t else (None, None)
+      runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gt[0], est_R=R[0], gt_R=R[1])
                                        | {'fps': r['fps'], 'kfs': r['keyframes']})
     for name, rs in runs.items():   # median over start frames (a failed run counts as infinitely bad)
       if all(r is None for r in rs):
@@ -156,21 +165,83 @@ def summary(run_dirs, metrics=('drift', 'final', 'ate'), trajectory='final'):
       keys = [k for k in next(r for r in rs if r is not None) if not k.startswith('_')]
       rows.setdefault(name, {})[d] = {k: float(np.median([r[k] if r is not None else np.inf for r in rs]))
                                       for k in keys}
+      # chaos: how much the result depends on the start frame (max / min over the starts)
+      rows[name][d] |= {f'{k}_spread': float(np.max(v) / max(np.min(v), 1e-6))
+                        for k in ('final', 'rot', 'drift', 'ate')
+                        if len(v := [r[k] if r is not None else np.inf for r in rs]) > 1}
   names = sorted(rows, key=lambda n: datasets.all_names().index(n) if n in datasets.all_names() else 999)
   header = lambda title: print(f'\n{title:34s}' + ''.join(f' | {Path(d).name[-14:]:>14s}' for d in run_dirs))
   for metric in metrics:
-    header(f'{metric} [m]')
+    header(f"{metric} [{dict(rot='deg', lost_episodes='count', **{'lost%': '%'}).get(metric, 'm')}]")
     for n in names:
       cells = [f"{'FAIL':>14s}" if rows[n].get(d) is None and d in rows[n] else f"{'-':>14s}" if rows[n].get(d) is None
                else f"{rows[n][d][metric]:8.3f} ({rows[n][d]['tracked']:.2f})" for d in run_dirs]
       print(f'{n:34s}' + ''.join(f' | {c}' for c in cells))
-    for agg, fn in [('median', np.median), ('geo. mean', lambda v: np.exp(np.mean(np.log(np.maximum(v, 1e-4)))))]:
-      vals = [[rows[n][d][metric] if rows[n].get(d) else np.inf for n in names] for d in run_dirs]
+    geo = lambda v: np.exp(np.mean(np.log(np.maximum(v, 1e-4))))
+    if metric.startswith('lost'):     # counts, mostly zero: plain mean
+      vals = [[rows[n][d][metric] if rows[n].get(d) else np.nan for n in names] for d in run_dirs]
+      print(f"{'mean':34s}" + ''.join(f' | {np.nanmean(v):14.2f}' for v in vals))
+      continue
+    for agg, fn, key in [('median', np.median, metric), ('geo. mean', geo, metric),
+                         ('spread over starts (geo. mean)', geo, f'{metric}_spread')]:
+      vals = [[rows[n][d].get(key, np.nan) if rows[n].get(d) else np.inf for n in names] for d in run_dirs]
       print(f'{agg:34s}' + ''.join(f' | {fn(v):14.4f}' for v in vals))
+    # paired comparison with the first run: per-sequence ratio, geometric mean with a bootstrap 95% interval
+    cells = []
+    for d in run_dirs[1:]:
+      r = np.array([rows[n][d][metric] / rows[n][run_dirs[0]][metric] for n in names
+                    if rows[n].get(d) and rows[n].get(run_dirs[0]) and np.isfinite(rows[n][d][metric])
+                    and np.isfinite(rows[n][run_dirs[0]][metric]) and rows[n][run_dirs[0]][metric] > 0])
+      if len(r) == 0:
+        cells.append(f"{'-':>14s}")
+        continue
+      boot = np.exp(np.log(r)[np.random.default_rng(0).integers(0, len(r), (2000, len(r)))].mean(axis=1))
+      lo, hi = np.percentile(boot, [2.5, 97.5])
+      cells.append(f'{np.exp(np.log(r).mean()):.2f} [{lo:.2f},{hi:.2f}] {int((r < 1).sum())}/{int((r > 1).sum())}')
+    if cells:
+      print(f"{'vs first: ratio [95% CI] bet/worse':34s} | {'':>14s}" + ''.join(f' | {c:>14s}' for c in cells))
   header('fps / keyframes')
   for n in names:
     print(f'{n:34s}' + ''.join(f" | {rows[n][d]['fps']:6.1f} {rows[n][d]['kfs']:5.0f}  " if rows[n].get(d) else
                                f" | {'-':>14s}" for d in run_dirs))
+
+
+def view(run_dirs, save=None):
+  '''
+  rerun view of saved runs (NAME or NAME@START dirs): ground truth, the estimate aligned on the initial section (10%
+  and 20% coverage; the section itself highlighted), live and hindsight trajectories, errors over time
+  '''
+  import rerun as rr
+  rr.init('nanoslam-turbo-view', spawn=save is None)
+  if save is not None:
+    rr.save(save)
+  for d in map(Path, run_dirs):
+    name = d.name.split('@')[0]
+    t = np.load(d / 'trajectory.npz')
+    gt = datasets.load(name).gt[-len(t['final']):, :3, 3]
+    rr.log(f'{d.name}/gt', rr.LineStrips3D([gt[np.isfinite(gt).all(axis=1)]], radii=0.004, colors=[150, 150, 150]),
+           static=True)
+    for coverage, color in [(0.1, [0, 120, 255]), (0.2, [255, 140, 0])]:
+      for kind in ['online', 'final']:
+        m = evaluate.evaluate(t[kind], gt, coverage=coverage)
+        a = m['_aligned']
+        path = f'{d.name}/coverage_{coverage:.1f}/{kind}'
+        rr.log(f'{path}/trajectory', rr.LineStrips3D([a[np.isfinite(a).all(axis=1)]], radii=0.003,
+                                                      colors=color if kind == 'online' else [c // 2 for c in color]),
+               static=True)
+        if kind == 'online':
+          rr.log(f'{d.name}/coverage_{coverage:.1f}/initial_section', rr.LineStrips3D([gt[m['_init']]], radii=0.012,
+                                                                                       colors=[0, 200, 0]), static=True)
+        for i in range(0, len(gt), 2):
+          rr.set_time('frame', sequence=i)
+          if np.isfinite(m['_err'][i]):
+            rr.log(f'error/{d.name}/coverage_{coverage:.1f}/{kind}', rr.Scalars(float(m['_err'][i])))
+          if kind == 'online' and np.isfinite(a[i]).all():
+            rr.log(f'{path}/camera', rr.Points3D([a[i]], radii=0.03, colors=color))
+            rr.log(f'{d.name}/gt_camera', rr.Points3D([gt[i]], radii=0.03, colors=[150, 150, 150]))
+        rr.reset_time()
+        print(f"{d.name} coverage {coverage:.1f} {kind:6s}: init section {m['init_frames']} frames, "
+              f"final {m['final']:.3f} drift {m['drift']:.3f} ate {m['ate']:.3f}")
 
 
 def setup_rerun(name, save=None):
@@ -219,11 +290,13 @@ def main():
   parser.add_argument('--rerun', action='store_true', help='visualize with rerun')
   parser.add_argument('--rerun-save', help='write the rerun recording to this .rrd file instead')
   parser.add_argument('--quiet', action='store_true')
-  parser.add_argument('--trajectory', default='final', help="summary: 'final' (final keyframe poses) or 'online' (live)")
+  parser.add_argument('--trajectory', default='online', help="summary: 'online' (live poses) or 'final' (hindsight)")
   parser.add_argument('--perturb', type=int, help='perturb all numeric parameters randomly (seed)')
   args = parser.parse_args()
   if args.dataset == 'summary':
     return summary(args.runs, trajectory=args.trajectory)
+  if args.dataset == 'view':
+    return view(args.runs, args.rerun_save)
   if args.perturb is not None:
     args.set = perturbed(args.perturb) + args.set
     print('perturbed config:', ' '.join(args.set))
