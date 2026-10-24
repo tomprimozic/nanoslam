@@ -1,0 +1,159 @@
+'''
+Dataset loaders. Every dataset yields undistorted grayscale images (so everything downstream is pinhole) and
+ground truth camera-to-world poses T_wc in the usual optical frame (x right, y down, z forward).
+
+  TUM RGB-D       fr3/long_office_household, fr2/desk              rgbd_dataset_freiburg*/
+  EuRoC MAV       MH_01..05, V1_01..03, V2_01..03                  euroc/<name>/mav0/   (cam0 only)
+  TartanAir       abandonedfactory, carwelding, seasidetown, ...   tartanair/<name>_sample_P00x/P00x/
+'''
+import os
+import re
+import concurrent.futures
+from pathlib import Path
+
+import cv2
+import yaml
+import numpy as np
+import pandas as pd
+import scipy.spatial.transform
+from scipy.spatial.transform import Rotation
+
+
+ROOT = Path(os.environ.get('NANOSLAM_DATASETS', Path(__file__).resolve().parent.parent / 'datasets'))
+
+
+def make_K(fx, fy, cx, cy):
+  return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
+
+def interpolate_poses(t_query, t, pos, quat_xyzw, max_gap=0.1):
+  '''
+  linear position + slerp rotation at `t_query` (must lie within `t`); NaN where the ground truth has a gap
+  (e.g. fr2/desk has a 12 s mocap dropout)
+  '''
+  keep = np.r_[True, np.diff(t) > 0]     # a few ground truth files have duplicate timestamps
+  t, pos, quat_xyzw = t[keep], pos[keep], quat_xyzw[keep]
+  P = np.stack([np.interp(t_query, t, pos[:, i]) for i in range(3)], axis=1)
+  R = scipy.spatial.transform.Slerp(t, Rotation.from_quat(quat_xyzw))(t_query).as_matrix()
+  T = np.tile(np.eye(4), (len(t_query), 1, 1))
+  T[:, :3, :3], T[:, :3, 3] = R, P
+  i = np.clip(np.searchsorted(t, t_query), 1, len(t) - 1)
+  T[t[i] - t[i - 1] > max_gap] = np.nan
+  return T
+
+
+class Dataset:
+  name: str
+  K: np.ndarray         # pinhole intrinsics of the *undistorted* images
+  width: int
+  height: int
+  files: list           # image paths
+  timestamps: np.ndarray
+  gt: np.ndarray        # (N, 4, 4) T_wc
+
+  def setup_undistortion(self, K, dist):
+    self.maps = None
+    if dist is not None and np.any(dist):
+      K_new, _ = cv2.getOptimalNewCameraMatrix(K, dist, (self.width, self.height), alpha=0)
+      self.maps = cv2.initUndistortRectifyMap(K, dist, None, K_new, (self.width, self.height), cv2.CV_16SC2)
+      K = K_new
+    self.K = K
+
+  def __len__(self):
+    return len(self.files)
+
+  def load(self, i):
+    img = cv2.imread(str(self.files[i]), cv2.IMREAD_GRAYSCALE)
+    if self.maps is not None:
+      img = cv2.remap(img, *self.maps, cv2.INTER_LINEAR)
+    return img
+
+  def images(self, start=0, stop=None, prefetch=8):
+    '''yields (index, image), loading ahead in background threads (cv2 releases the GIL)'''
+    stop = len(self) if stop is None else min(stop, len(self))
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+      futures = [pool.submit(self.load, i) for i in range(start, min(start + prefetch, stop))]
+      for i in range(start, stop):
+        img = futures.pop(0).result()
+        if i + prefetch < stop:
+          futures.append(pool.submit(self.load, i + prefetch))
+        yield i, img
+
+
+class TUM(Dataset):
+  CAMERAS = {   # https://cvg.cit.tum.de/data/datasets/rgbd-dataset/file_formats#intrinsic_camera_calibration_of_the_kinect
+    'freiburg1': ([517.3, 516.5, 318.6, 255.3], [0.2624, -0.9531, -0.0054, 0.0026, 1.1633]),
+    'freiburg2': ([520.9, 521.0, 325.1, 249.7], [0.2312, -0.7849, -0.0033, -0.0001, 0.9172]),
+    'freiburg3': ([535.4, 539.2, 320.1, 247.6], None),    # fr3 images are already undistorted
+  }
+
+  def __init__(self, path: Path):
+    self.name = path.name.removeprefix('rgbd_dataset_')
+    rgb = pd.read_csv(path / 'rgb.txt', sep=' ', comment='#', names=['t', 'file'])
+    gt = pd.read_csv(path / 'groundtruth.txt', sep=' ', comment='#', names='t tx ty tz qx qy qz qw'.split()).to_numpy()
+    rgb = rgb[(rgb.t >= gt[0, 0]) & (rgb.t <= gt[-1, 0])]
+    self.files = [path / f for f in rgb.file]
+    self.timestamps = rgb.t.to_numpy()
+    self.gt = interpolate_poses(self.timestamps, gt[:, 0], gt[:, 1:4], gt[:, 4:8])
+    self.height, self.width = cv2.imread(str(self.files[0]), cv2.IMREAD_GRAYSCALE).shape
+    intrinsics, dist = self.CAMERAS[self.name.split('_')[0]]
+    self.setup_undistortion(make_K(*intrinsics), None if dist is None else np.array(dist))
+
+
+class EuRoC(Dataset):
+  def __init__(self, path: Path):
+    self.name = path.name
+    mav = path / 'mav0'
+    cam = yaml.safe_load((mav / 'cam0/sensor.yaml').read_text())
+    images = pd.read_csv(mav / 'cam0/data.csv')
+    gt = pd.read_csv(mav / 'state_groundtruth_estimate0/data.csv').to_numpy()
+    t_img = images.iloc[:, 0].to_numpy()
+    keep = (t_img >= gt[0, 0]) & (t_img <= gt[-1, 0])
+    self.files = [mav / 'cam0/data' / f for f in images.iloc[:, 1][keep]]
+    self.timestamps = t_img[keep] / 1e9
+    # ground truth is the body (IMU) pose, quaternions are w x y z
+    T_wb = interpolate_poses(self.timestamps, gt[:, 0] / 1e9, gt[:, 1:4], gt[:, [5, 6, 7, 4]])
+    T_bc = np.array(cam['T_BS']['data']).reshape(4, 4)
+    self.gt = T_wb @ T_bc
+    self.width, self.height = cam['resolution']
+    self.setup_undistortion(make_K(*cam['intrinsics']), np.array(cam['distortion_coefficients']))
+
+
+class TartanAir(Dataset):
+  def __init__(self, path: Path):
+    self.name = path.parent.name.replace('_sample', '')
+    self.files = sorted((path / 'image_left').glob('*.png'))
+    pose = np.loadtxt(path / 'pose_left.txt')
+    self.timestamps = np.arange(len(self.files)) / 10.0
+    T = np.tile(np.eye(4), (len(pose), 1, 1))
+    T[:, :3, :3] = Rotation.from_quat(pose[:, 3:7]).as_matrix()
+    T[:, :3, 3] = pose[:, :3]
+    # TartanAir poses are in NED (x forward, y right, z down): rotate the body frame into the optical frame
+    T_ned_optical = np.eye(4)
+    T_ned_optical[:3, :3] = [[0, 0, 1], [1, 0, 0], [0, 1, 0]]
+    self.gt = T @ T_ned_optical
+    self.width, self.height = 640, 480
+    self.setup_undistortion(make_K(320, 320, 320, 240), None)
+
+
+def all_names():
+  names = [p.name.removeprefix('rgbd_dataset_') for p in sorted(ROOT.glob('rgbd_dataset_*')) if p.is_dir()]
+  names += [p.name for p in sorted((ROOT / 'euroc').glob('*')) if (p / 'mav0').is_dir()]
+  names += [p.name.replace('_sample', '') for p in sorted((ROOT / 'tartanair').glob('*')) if p.is_dir()]
+  return names
+
+
+ALIASES = {'household': 'freiburg3_long_office_household', 'desk': 'freiburg2_desk'}
+
+
+def load(name: str) -> Dataset:
+  name = ALIASES.get(name, name)
+  if (p := ROOT / f'rgbd_dataset_{name}').is_dir():
+    return TUM(p)
+  for p in sorted((ROOT / 'euroc').glob('*')):
+    if p.name.lower().startswith(name.lower()):    # 'MH_01' or 'MH_01_easy'
+      return EuRoC(p)
+  for p in sorted((ROOT / 'tartanair').glob('*')):
+    if p.name.replace('_sample', '').startswith(name):
+      return TartanAir(next(q for q in p.iterdir() if q.is_dir() and re.fullmatch(r'P\d+', q.name)))
+  raise ValueError(f'unknown dataset {name}, available: {all_names()}')
