@@ -35,7 +35,7 @@ class Config:
   klt_iters = 30
   klt_fb = 0.5                      # px, forward-backward check
   motion_model = 'constant'         # pose prediction: 'none', 'constant' (velocity), 'accel' (constant acceleration)
-  phase_prior = False               # global image shift by phase correlation corrects the KLT initial guesses
+  phase_prior = True                # global image shift by phase correlation corrects the KLT initial guesses
   phase_min_response = 0.05         # phase correlation peak needed to trust the shift
   phase_min_correction = 2.0        # px, only correct the prediction by larger differences
 
@@ -83,7 +83,6 @@ class Config:
   # patch search (search by projection, re-measurement)
   patch_half = 4                    # 9x9
   patch_iters = 20
-  patch_trim = 0.0                  # fraction of the largest residuals left out of each LK iteration (0 = off)
   search_max_angle = 35.0           # deg, max viewing angle difference to the source keyframe
   search_max_scale = 1.8            # max viewing distance ratio
   search_radius = 4.0               # px
@@ -582,7 +581,7 @@ class SLAM:
     A, _, good = lk.affine_warps(self.K, m.kfs.T[src_kf[sel]], T_cw, X[sel], src_uv[sel])
     sel, A = sel[good], A[good]
     uv[sel], ncc[sel] = lk.align_patches(m.images.levels, m.kfs.slot[src_kf[sel]], pyr, src_uv[sel], A, guess[sel],
-                                         top_level, search_px, c.patch_half, c.patch_iters, c.patch_trim)
+                                         top_level, search_px, c.patch_half, c.patch_iters)
     return uv, ncc
 
   def search(self, T_cw, pyr, pts, top_level=0, search_px=0, radius=None, count=False):

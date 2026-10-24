@@ -76,14 +76,13 @@ def sample_template(src, us, vs, A, scale_src, scale_tgt, half, T):
 
 
 @njit(cache=True, nogil=True)
-def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, half, max_iter, trim=0.0):
+def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, half, max_iter):
   '''
   src_pyr: pyramids of all source keyframes (a tuple of (n_keyframes, h, w) uint8 arrays, one per level), src_index:
   (n,) which one each point's patch comes from, tgt_pyr: pyramid of the target image (tuple of (h, w) uint8 arrays),
   uv_src: (n, 2) observations in the source keyframes, A: (n, 2, 2) affine warps target -> source (level 0 pixels),
   uv_guess: (n, 2) initial positions in the target, top_level: coarsest target level, search_px: half-width of the
-  brute-force ZNCC search on the top level (0 = none), trim: fraction of the pixels with the largest residuals left out
-  of every LK iteration (robust to the background showing in patches on a depth edge)
+  brute-force ZNCC search on the top level (0 = none)
   returns uv (n, 2), ncc (n,) (-1 = failed)
   '''
   n = len(uv_src)
@@ -153,31 +152,13 @@ def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, s
           ok = False
           break
         b0, b1 = 0.0, 0.0
-        if trim > 0:   # robust: leave out the largest residuals (the Hessian has to follow the mask)
-          R = I - Tn
-          thr = np.sort(np.abs(R).ravel())[int((1 - trim) * (P * P - 1))]
-          h00, h01, h11 = 0.0, 0.0, 0.0
-          for i in range(P):
-            for j in range(P):
-              if abs(R[i, j]) <= thr:
-                b0 += gx[i, j] * R[i, j]
-                b1 += gy[i, j] * R[i, j]
-                h00 += gx[i, j] ** 2
-                h01 += gx[i, j] * gy[i, j]
-                h11 += gy[i, j] ** 2
-          d = h00 * h11 - h01 * h01
-          if d < 1e-6 * (h00 + h11) ** 2 or h00 + h11 < 1e-6:
-            h00, h01, h11, d = H00, H01, H11, det
-          dx = (h11 * b0 - h01 * b1) / d
-          dy = (h00 * b1 - h01 * b0) / d
-        else:
-          for i in range(P):
-            for j in range(P):
-              r = I[i, j] - Tn[i, j]
-              b0 += gx[i, j] * r
-              b1 += gy[i, j] * r
-          dx = (H11 * b0 - H01 * b1) / det
-          dy = (H00 * b1 - H01 * b0) / det
+        for i in range(P):
+          for j in range(P):
+            r = I[i, j] - Tn[i, j]
+            b0 += gx[i, j] * r
+            b1 += gy[i, j] * r
+        dx = (H11 * b0 - H01 * b1) / det
+        dy = (H00 * b1 - H01 * b0) / det
         x -= dx
         y -= dy
         if dx * dx + dy * dy < 1e-4:
