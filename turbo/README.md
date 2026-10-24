@@ -42,7 +42,9 @@ a *candidate* collects keyframe observations while it is tracked and becomes *ma
 succeeds (>= 1 deg parallax), like DSO's immature points, so no observations are thrown away.
 
 **Every frame.** CLAHE; KLT (OpenCV) in two passes: tracked map points from their projection at the constant-velocity
-prediction (shallow pyramid), everything else from its previous position; forward-backward check. RANSAC PnP (poselib)
+prediction (shallow pyramid), everything else from its previous position; forward-backward check. The global image
+shift from phase correlation (pyramid level 2) corrects both initial guesses when the motion is not what the velocity
+predicted (fast rotations). RANSAC PnP (poselib)
 with Huber refinement. Candidate tracks far from the epipolar line of their first observation are dropped. If fewer
 than 50 map points are tracked: *relocalization by projection* (local map, wide window). If tracking is lost (fast
 rotation + motion blur, e.g. V2_03): several pose hypotheses, DSO-style: the last good pose rotated by +-15 / 30 deg,
@@ -217,6 +219,8 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | no global BA after loop closures, full | 1.21 [0.92, 1.73], rotation 1.23 [1.04, 1.56] | keep it |
 | no loop correction at all (old points only fused, no pose graph / global BA), full | 1.11 [0.73, 1.70], rotation 0.92 [0.72, 1.12] | inconclusive (only ~10 sequences close loops) |
 | global BA with 3 iterations instead of 10, full, 2 seeds | 0.92 [0.84, 0.99], ATE 0.91 [0.83, 0.98], rotation 1.03 [1.00, 1.07] | adopted (3x cheaper) |
+| phase-correlation prior for KLT (global image shift on pyramid level 2, `cv2.phaseCorrelate`), full, 2 seeds | final 1.04 [0.87, 1.22], rotation **0.88 [0.77, 0.99]** (14/3), lost frames 5.0 -> 3.9% | adopted |
+| trim the 20% largest residuals inside each patch-alignment iteration (robust LK), 2 seeds | full 1.10 [1.01, 1.20], VO 1.17 [1.04, 1.33] | no (9x9 patches are too small to lose 20%) |
 | our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
 
 Where the error comes from: rotation error at the end is 90-100% *systematic* (the same for all start frames) on
