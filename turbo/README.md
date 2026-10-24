@@ -13,6 +13,8 @@ cd turbo
 ../.venv/bin/python run.py all --out runs/X --set loop=False final_ba_iters=0   # override any Config value
 ../.venv/bin/python run.py all --out runs/P --perturb 3   # every numeric parameter randomly scaled by 0.7-1.4x
 ../.venv/bin/python run.py summary runs/A runs/B          # compare runs (metrics recomputed from trajectories)
+../.venv/bin/python run.py summary runs/A0+runs/A1 runs/B0+runs/B1   # ... pooled over seeds
+../.venv/bin/python run.py view runs/A/household@0       # rerun view of saved runs (alignment, errors over time)
 ```
 
 Datasets live in `../datasets` (override with `NANOSLAM_DATASETS`): TUM RGB-D `rgbd_dataset_freiburg*/`, EuRoC
@@ -50,7 +52,9 @@ then, round-robin, all keyframe poses (nearest first), each searched with its ow
 observation, warped with the local affine approximation of the homography of the plane through the point
 (fronto-parallel in the keyframe), from the pyramid level whose resolution matches the target level. Inverse
 compositional LK on zero-mean / unit-variance patches (gain + bias invariant), coarse to fine, optionally starting with
-a brute-force ZNCC search on the top level for wide windows. ~0.03 px on synthetic warps, 3-15 us per point.
+a brute-force ZNCC search on the top level for wide windows. ~0.03 px on synthetic warps, 3-15 us per point. Keyframe
+pyramids live in one (slots, h, w) array per level (`lk.ImageStore`), so all points are aligned in one call whatever
+keyframe their patch comes from.
 
 **Every keyframe** (rotation-compensated median parallax >= 1.75 deg, or tracking getting thin):
 1. *re-measure* tracked map points with patches from their reference keyframe: KLT positions accumulate template
@@ -67,12 +71,15 @@ a brute-force ZNCC search on the top level for wide windows. ~0.03 px on synthet
    hovering);
 7. new corners in empty grid cells (the strongest min-eigenvalue corner per cell).
 
-**Loops by projection** (no place recognition). Points not seen for 20 keyframes are searched with a wide window (top
-pyramid level 2 + brute-force search). If they agree on a pose (PnP on them alone) that differs from the current one
+**Loops by projection** (no place recognition). At every 3rd keyframe, points not seen for 20 keyframes are searched
+with a wide window (top pyramid level 2 + brute-force search). If they agree on a pose (PnP on them alone) that differs from the current one
 by < 5 px, they are just fused (map reuse: local BA pulls the keyframe in); if by more: scale drift from the depth
 ratio of old vs. nearby current points, Sim3 pose graph over the *essential graph* (spanning tree + the 5 strongest
 covisibility links per keyframe, all at their current relative poses, so only the new loop edge has an error), points
-move with their reference keyframe, old points are re-searched and fused, global BA.
+move with their reference keyframe, old points are re-searched and fused, then a global BA - in a background thread
+on a snapshot of the map, merged 60 frames later ORB-SLAM style (keyframes created meanwhile move with their nearest
+corrected ancestor, points with their reference keyframe). It is merged at a fixed frame, never "when it is done",
+so runs stay deterministic.
 
 **Optimization** (`optim.py`). BA: Levenberg-Marquardt, Huber, points eliminated with the Schur complement; the
 reduced camera system is dense (Cholesky), fine for local BA and for global BA up to a few hundred keyframes. Poses are
@@ -82,45 +89,64 @@ too (with two fixed keyframes it never is). Sim3 pose graph: LM with per-edge nu
 and a sparse solve (400 nodes in 0.15 s).
 
 **Evaluation** (`evaluate.py`). The estimate is Sim3-aligned to the ground truth on the *initial section* only: the
-shortest prefix (from the first tracked frame) whose ground truth covers 10% of the full extent along both main axes
-(a trajectory spanning 20 x 10 m is aligned on the prefix that spans 2 x 1 m). Then `drift` = RMSE over all frames,
-`final` = RMSE over the last 10% of frames, `drift%` = drift / path length, `ate` = the usual whole-trajectory
-alignment (for reference), `scale` = scale of the final section relative to the initial one. Frames where tracking was
-lost are scored with the last pose (losing track must not be better than tracking badly); ground truth gaps (fr2/desk
-has a 12 s mocap dropout) are skipped. The default trajectory uses the final keyframe poses (after loops / final BA).
+shortest prefix (from the first tracked frame) whose ground truth covers 20% of the full extent along both main axes
+(a trajectory spanning 20 x 10 m is aligned on the prefix that spans 4 x 2 m). Poses are the *live* ones (as estimated
+at that frame); `--trajectory final` uses the keyframe poses with hindsight (after later loop closures / final BA).
 
-Single runs are chaotic (a few points surviving a hard segment decide the scale): compare configurations with
-`--starts 0,7,14` (median over start frames per sequence, geometric mean over sequences), and in VO mode
-(`--set loop=False final_ba_iters=0`) for drift.
+- `final` (headline): RMSE over the last 10% of frames
+- `rot`: rotation drift, RMS over the last 10% of frames of the error of the rotation since the end of the initial
+  section (deg; independent of the alignment)
+- `drift`: RMSE over all frames; `ate`: the usual whole-trajectory alignment (for reference); `scale`: scale of the
+  final section relative to the initial one; `tracked`: fraction of frames with a pose
+- frames where tracking was lost are scored with the last pose (losing track must not be better than tracking badly);
+  ground truth gaps (fr2/desk has a 12 s mocap dropout) are skipped
+
+Per frame, runs also save intrinsic diagnostics (`stats_*` in `trajectory.npz`): residual scale of the PnP (MAD),
+inliers, image flow, sharpness, tracked / candidate counts, latency.
+
+**Noise.** Runs are deterministic (same start frame + seed = identical poses, also with the background BA thread), but
+chaotic: compare configurations with `--starts 0,5,10,15,20`, preferably pooled over two seeds (`summary
+runs/A0+runs/A1 runs/B0+runs/B1`). The summary gives per sequence the median over the runs, the geometric mean over
+sequences, the *spread* (max / min over the start frames: how chaotic it is) and a paired comparison with the first
+column (geometric mean of the per-sequence ratios with a bootstrap 95% interval, sequences better / worse). Measured
+noise floor: changing only the RANSAC seed moves the geometric mean of `final` by 6-9% (95% interval up to +-20-30%),
+so with 5 starts x 17 sequences effects below ~15% are not resolvable.
 
 ## Results
 
-Median over 3 start frames (0, 7, 14) per sequence, lost frames scored with the last pose, metres. *full* = the
-default system (loops + final BA), *VO* = `loop=False final_ba_iters=0` (local map reuse only, no loop closing, no
-final BA). One config for all 17 sequences; only the camera calibration comes from the dataset. (`runs/final_full`,
-`runs/final_vo`)
+*Live* poses (as estimated at each frame), median over 10 runs per sequence (start frames 0, 5, 10, 15, 20 x RANSAC
+seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
+[m], *rot* = rotation drift [deg], *ATE* = whole-trajectory alignment [m]. *full* = the default system, *VO* =
+`loop=False final_ba_iters=0` (no loop closing). One config for all 17 sequences; only the camera calibration comes
+from the dataset. (`runs/x_final_seed*`, `runs/v_final_vo_seed*`). *lost* = tracking losses after initialization
+(mean over the runs; frames before initialization are not counted).
 
-| sequence | drift (full) | final (full) | ATE (full) | drift (VO) | ATE (VO) | tracked |
-|---|---|---|---|---|---|---|
-| fr2/desk | 0.035 | 0.009 | 0.010 | 0.066 | 0.013 | 0.99 |
-| fr3/long_office_household | 0.067 | 0.013 | 0.011 | 0.106 | 0.041 | 0.98 |
-| MH_01_easy | 0.037 | 0.029 | 0.013 | 0.118 | 0.087 | 1.00 |
-| MH_02_easy | 0.073 | 0.027 | 0.018 | 0.073 | 0.040 | 1.00 |
-| MH_03_medium | 0.087 | 0.037 | 0.026 | 0.260 | 0.164 | 1.00 |
-| MH_04_difficult | 0.303 | 0.047 | 0.050 | 0.347 | 0.122 | 0.99 |
-| MH_05_difficult | 0.150 | 0.074 | 0.043 | 0.173 | 0.111 | 0.96 |
-| V1_01_easy | 0.187 | 0.103 | 0.033 | 0.192 | 0.055 | 0.97 |
-| V1_02_medium | 0.025 | 0.017 | 0.008 | 0.146 | 0.113 | 0.96 |
-| V1_03_difficult | 0.037 | 0.024 | 0.014 | 0.106 | 0.065 | 0.95 |
-| V2_01_easy | 0.032 | 0.013 | 0.014 | 0.147 | 0.065 | 0.97 |
-| V2_02_medium | 0.029 | 0.032 | 0.010 | 0.225 | 0.102 | 0.98 |
-| V2_03_difficult | 0.624 | 0.071 | 0.579 | 0.741 | 0.725 | 0.86 |
-| abandonedfactory | 0.262 | 0.712 | 0.209 | 0.371 | 0.210 | 0.97 |
-| carwelding | 0.081 | 0.057 | 0.035 | 0.305 | 0.131 | 0.99 |
-| seasidetown | 2.988 | 5.551 | 2.893 | 3.240 | 2.895 | 0.26 |
-| seasonsforest | 0.180 | 0.219 | 0.057 | 0.197 | 0.079 | 0.99 |
-| **geometric mean** | **0.107** | **0.057** | **0.038** | **0.216** | **0.110** | |
+| sequence | final (full) | rot (full) | ATE (full) | final (VO) | rot (VO) | ATE (VO) | lost: episodes / frames |
+|---|---|---|---|---|---|---|---|
+| fr2/desk | 0.010 | 1.26 | 0.012 | 0.029 | 1.36 | 0.014 | 0.0 / 0.0% |
+| fr3/long_office_household | 0.013 | 0.87 | 0.033 | 0.154 | 2.48 | 0.049 | 0.0 / 0.0% |
+| MH_01_easy | 0.039 | 3.51 | 0.028 | 0.207 | 3.72 | 0.083 | 0.0 / 0.0% |
+| MH_02_easy | 0.043 | 1.16 | 0.035 | 0.143 | 1.32 | 0.048 | 0.0 / 0.0% |
+| MH_03_medium | 0.022 | 1.82 | 0.045 | 0.252 | 0.89 | 0.158 | 0.0 / 0.0% |
+| MH_04_difficult | 0.086 | 0.34 | 0.082 | 0.171 | 0.47 | 0.116 | 0.0 / 0.0% |
+| MH_05_difficult | 0.091 | 0.83 | 0.078 | 0.233 | 0.98 | 0.132 | 0.0 / 0.0% |
+| V1_01_easy | 0.074 | 3.30 | 0.035 | 0.110 | 3.48 | 0.053 | 0.0 / 0.0% |
+| V1_02_medium | 0.016 | 0.49 | 0.018 | 0.154 | 2.74 | 0.121 | 0.0 / 0.0% |
+| V1_03_difficult | 0.069 | 1.12 | 0.041 | 0.159 | 6.73 | 0.076 | 0.0 / 0.0% |
+| V2_01_easy | 0.013 | 0.34 | 0.033 | 0.230 | 1.13 | 0.062 | 0.0 / 0.0% |
+| V2_02_medium | 0.048 | 2.08 | 0.027 | 0.235 | 3.96 | 0.082 | 0.0 / 0.0% |
+| V2_03_difficult | 0.173 | 2.32 | 0.625 | 0.340 | 3.45 | 0.685 | 2.7 / 10.4% |
+| abandonedfactory P001 | 0.808 | 7.69 | 0.223 | 0.808 | 7.69 | 0.223 | 1.0 / 2.3% |
+| carwelding P007 | 0.291 | 0.68 | 0.102 | 0.431 | 0.59 | 0.120 | 0.0 / 0.0% |
+| seasidetown P003 | 5.970 | 132.80 | 2.879 | 5.970 | 132.80 | 2.879 | 1.0 / 75.0% |
+| seasonsforest P002 | 0.293 | 0.18 | 0.079 | 0.293 | 0.18 | 0.079 | 0.0 / 0.0% |
+| **geometric mean** | **0.078** | **1.49** | **0.066** | **0.245** | **2.21** | **0.112** | |
 
+- With hindsight (`--trajectory final`: keyframe poses after all loop closures and the final BA) the full system's
+  ATE is ~2x lower (geometric mean ~3.8 cm in the first round); live is what a robot would have had.
+- The TartanAir samples are short point-to-point flights that barely revisit anything (0-2% of frames come back
+  within 1 m with a similar view; seasidetown 13%, but tracking is lost there by then), so full ~ VO there. For
+  comparison V1_02 57%, household 97%.
 - On the frames it tracks, V2_03 is ~3 cm ATE; its large numbers come from a ~170 frame stretch through a part of
   the room that was never mapped, after motion blur (relocalization can't succeed there; `reinit=True` starts a new
   map segment but rarely merges it correctly). abandonedfactory loses track in its last 10 frames (dark wall, fast),
@@ -128,19 +154,32 @@ final BA). One config for all 17 sequences; only the camera calibration comes fr
 - For orientation only (the numbers vary between papers): ORB-SLAM3 monocular on EuRoC is reported at MH_01
   1.6-2.9 cm, MH_04 8.5-13.8 cm, V2_03 36-52 cm or a failure ([1](https://arxiv.org/pdf/2405.03413),
   [2](https://arxiv.org/pdf/2012.11863), [3](https://arxiv.org/pdf/2405.13748)).
-- The human-written `nanoslam.py` on household, same evaluation and start frames (online poses): drift 0.266, ATE
-  0.134 (0.044 / 0.134 / 0.173 for starts 0 / 7 / 14).
-- `drift` is dominated by the alignment lever arm: an error of the initial section's orientation of a degree makes
-  tens of cm at the far end (V1_01: ATE 3 cm, drift 19 cm). Better initialization is where it improves next.
-- Speed (single process, M5 Pro): household 96 fps, MH_01 100 fps, V1_02 39 fps (fast motion = many keyframes; local
-  BA dominates). Tracking ~3 ms / frame, keyframes ~30-70 ms.
-- Robustness to the parameters: 4 random perturbations of *all* numeric parameters (each scaled by 0.7-1.4x):
-  geometric mean ATE 1.9-2.4 cm vs 2.3 cm with the defaults (single runs, lost frames not scored; `runs/v5_perturb*`).
+- The human-written `nanoslam.py` on household, same evaluation (live, 20%), starts 0 / 7 / 14: final 0.084 /
+  0.367 / 0.560, ATE 0.044 / 0.134 / 0.173 (turbo: final 0.013 full, 0.154 VO).
+- `drift` (all frames, initial-section alignment) is dominated by the alignment lever arm: a degree of error in the
+  initial section's orientation makes tens of cm at the far end; `rot` measures the rotation drift without it.
+- Speed (single process, M5 Pro, full system): household 144 fps, MH_01 120, MH_03 58, V2_02 57, V1_02 52.
+  Latency per frame type (ms, p50 / p99 / max; `stats_ms`, `stats_keyframe`, `stats_loop_search`, `stats_loop_closed`):
+
+  | | frames | keyframes | keyframes with loop search (every 3rd) | loop closures |
+  |---|---|---|---|---|
+  | household | 2.4 / 3.5 / 101 | 22 / 69 / 81 | 26 / 99 / 123 | 226 / 307 / 308 (3) |
+  | MH_01 | 2.5 / 3.8 / 80 | 31 / 135 / 237 | 41 / 221 / 357 | - |
+  | MH_03 | 2.8 / 4.1 / 97 | 40 / 147 / 175 | 71 / 240 / 259 | 1049 (1) |
+  | V1_02 | 2.8 / 4.4 / 102 | 29 / 94 / 149 | 48 / 159 / 189 | 642 / 1614 / 1633 (3) |
+  | V2_02 | 2.7 / 4.2 / 89 | 28 / 92 / 122 | 58 / 195 / 248 | 128 / 150 / 150 (2) |
+
+  Loop closures are synchronous for the pose graph (0.1-0.8 s: numerical Jacobians over all keyframes) and the
+  re-search; the global BA (3 iterations) runs in the background. The ~100 ms frame maxima are merges of the
+  background BA / relocalization.
+- Robustness to the parameters (first round, hindsight ATE, single runs, lost frames not scored): 4 random
+  perturbations of *all* numeric parameters (each scaled by 0.7-1.4x): geometric mean ATE 1.9-2.4 cm vs 2.3 cm with
+  the defaults (`runs/v5_perturb*`) - i.e. within the noise floor measured later.
 
 ## What was tried
 
-Measured on all sequences; "ensemble" = 3 start frames, lost frames scored; differences below ~5% of the geometric
-mean are noise.
+First round: hindsight poses, 10% coverage; "ensemble" = 3 start frames (the noise floor was only measured later, see
+the second round: differences below ~10-15% are not resolvable).
 
 | change | effect | |
 |---|---|---|
@@ -157,6 +196,35 @@ mean are noise.
 | intensity stretch before CLAHE (dark images) | no effect | removed |
 | VO: ba_window 15, ba_iters 20, 30 cells, kf_parallax 1.0 / 2.5, tri_min_angle 0.5 / 2.0 | none better (the defaults are on a plateau) | - |
 
+Second round (live poses, 20% coverage; VO = `loop=False final_ba_iters=0`, full = default system; 5 start frames;
+ratio of `final` vs the baseline = geometric mean of per-sequence ratios [bootstrap 95% interval]; for reference,
+changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32] (full)):
+
+| change | ratio | |
+|---|---|---|
+| no motion model (constant velocity -> none), VO, 3 starts | 1.21 | keep constant velocity |
+| constant acceleration, VO, 3 starts | 1.03 | no |
+| no 3x3 blur before the corner score, VO | 1.18 [1.08, 1.31] | keep the blur |
+| keep tracking PnP outliers ("soft"), VO | 1.21 [1.05, 1.42] | no |
+| Cauchy instead of Huber in BA, VO | 1.04 [0.86, 1.28] | noise |
+| no keyframe culling, VO | 1.08 [0.96, 1.23] | keep culling |
+| + ORB-style thinning of old keyframes (redundant, > 20 keyframes old), VO | 0.98 [0.86, 1.08], 14% fewer keyframes | option |
+| adaptive thresholds: PnP inliers at the live noise level, VO | 0.94 [0.76, 1.18] | option (`adaptive_pnp`) |
+| adaptive thresholds: keyframe noise as BA weights, VO | 1.19 [1.07, 1.35] | no |
+| drop tracks that slipped > 2 px at re-measurement, VO, 3 starts | 0.97 | option |
+| no second local BA after fusing old points, full | 1.16 [1.03, 1.33] | keep it |
+| search old points only every 3rd keyframe, full | 0.99 [0.88, 1.12], ~1/3 of the loop search time | adopted |
+| no global BA after loop closures, full | 1.21 [0.92, 1.73], rotation 1.23 [1.04, 1.56] | keep it |
+| no loop correction at all (old points only fused, no pose graph / global BA), full | 1.11 [0.73, 1.70], rotation 0.92 [0.72, 1.12] | inconclusive (only ~10 sequences close loops) |
+| global BA with 3 iterations instead of 10, full, 2 seeds | 0.92 [0.84, 0.99], ATE 0.91 [0.83, 0.98], rotation 1.03 [1.00, 1.07] | adopted (3x cheaper) |
+| our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
+
+Where the error comes from: rotation error at the end is 90-100% *systematic* (the same for all start frames) on
+almost every sequence; part of it is the orientation of the initial-section alignment (V1_01: 6 deg right after the
+initial section, then < 1 deg of drift), part real drift (MH_01: 4 deg of yaw over 80 m, ~0.8 deg per 1% of focal
+length error). Local rotation drift correlates best with image flow (rank correlation +0.39, fast motion), less with
+the PnP residual scale (+0.18), sharpness (-0.15) or the number of tracked map points (-0.18).
+
 Bugs that cost the most time: `scipy.linalg.solve(assume_a='pos')` (scipy 1.18.1 / Accelerate) corrupts the heap,
 the crash then shows up anywhere (numba cache loading, GC at exit) - BA uses `cho_factor`; scoring only tracked frames
 made losing track look *better* than tracking badly; fr2/desk ground truth interpolated over a 12 s mocap gap.
@@ -164,6 +232,12 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
 ## Next
 
 - initialization (DfUSMC / Instant VO-style small-motion init): the start of the trajectory dominates `drift`;
-- voxel map instead of keyframes for reprojection and loops; dense / semi-dense reconstruction;
-- tracking through very fast motion (TartanAir) and re-joining new map segments reliably;
-- sparse reduced camera system for global BA beyond ~1000 keyframes; DSO-style marginalization in the local window.
+- cheaper global BA: it is 1-4 s for 300-600 keyframes (the LM loop in Python competes for the GIL with tracking;
+  move the whole LM into numba, fewer iterations, or only the loop's region) - the remaining latency spikes;
+- the chaos is mostly the random walk of the drift itself (max / min over start frames of a random walk's endpoint
+  is naturally ~2x): it goes down with the per-step error, not with "smoother" decisions (none of the soft /
+  adaptive variants reduced it measurably). Image flow is the best intrinsic predictor of where rotation drift is
+  made: a candidate signal for more keyframes / more points under fast motion;
+- voxel map instead of keyframes for reprojection and loops (search by projection and the old-point search are O(map));
+  dense / semi-dense reconstruction;
+- tracking through very fast motion (TartanAir) and re-joining new map segments reliably.
