@@ -61,7 +61,7 @@ def lost_stats(est):
   return {'lost_episodes': int(np.sum(ok[:-1] & ~ok[1:])), 'lost%': float(100 * (~ok).mean())}
 
 
-def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None):
+def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align_est=None):
   '''
   est, gt: (N, 3) camera centres (rows NaN where not tracked / no ground truth). Lost frames are scored with the last
   estimate (as a system that keeps reporting its last pose would be), so losing track is not better than tracking badly
@@ -83,7 +83,12 @@ def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None):
   init = idx[idx < first + n_init]
   if len(init) < 3:
     init = idx[:3]
-  to_gt, s_init = align(est[init], gt[init])
+  if align_est is not None:   # alignment from other estimates of the initial section (e.g. hindsight poses)
+    a = hold(align_est)
+    init_a = init[np.isfinite(a[init]).all(axis=1)]
+    to_gt, s_init = align(a[init_a], gt[init_a])
+  else:
+    to_gt, s_init = align(est[init], gt[init])
   err = np.full(len(gt), np.nan)
   err[idx] = np.linalg.norm(to_gt(est[idx]) - gt[idx], axis=1)
   final = idx[idx >= int(len(gt) * (1 - final_frac))]

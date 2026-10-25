@@ -239,6 +239,7 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | intermediate keyframes taken over from the init window | never triggers (init happens before 2x the keyframe parallax) | removed |
 | re-referencing the init window when the first frame's tracks die | the first keyframe is only ever given up on seasidetown (3-7 restarts in its first 20 frames) | not needed |
 | V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |
+| evaluation: initial-section alignment from the hindsight poses (applied to the live ones; `evaluate(align_est=)`) | VO: no change (final 0.254 vs 0.254); full: final 0.067 vs 0.075 but start spread 3.8 vs 2.7, drift worse (pose graphs move the early keyframes, so the two are in different frames) | kept live |
 | our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
 
 Where the error comes from: rotation error at the end is 90-100% *systematic* (the same for all start frames) on
