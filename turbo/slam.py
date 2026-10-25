@@ -68,6 +68,7 @@ class Config:
   local_map_radius = 3.0            # px
   reloc_min_3d = 50                 # relocalize (search the map with a wide window) below this many 3D tracks
   reloc_keyframes = 8               # keyframe poses tried per frame while lost
+  lost_rotation = True              # while lost: rotation-only poses from tracks of its own (live output + relocalization)
   reinit = False                    # start a new map segment when relocalization keeps failing
   reinit_after = 10                 # frames lost before that
 
@@ -156,6 +157,7 @@ class SLAM:
     self.pre_kfs = []                 # keyframes made before translation was established (rotation-only poses)
     self.anchor = -1                  # the one the translation test is relative to
     self.window_pose = None           # T_cw of the current frame from the window BA (translation established)
+    self.rt = None                    # while lost: rotation tracker [reference pose, reference pixels, pixels, count, pose]
     self.init_n_tracks = 0            # tracks right after the last of them
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
@@ -248,7 +250,7 @@ class SLAM:
     new = np.zeros((n, 2), np.float32)
     ok = np.zeros(n, bool)
     m = np.flatnonzero(self.mapped_tracks())
-    shift = self.global_shift(pyr) if c.phase_prior else None
+    shift = self.shift = self.global_shift(pyr) if c.phase_prior else None
     if len(m):
       guess, z = project(self.K, T_pred, self.map.pts.X[self.tr_pt[m]])
       bad = (z <= 0) | ~np.isfinite(guess).all(axis=1)
@@ -269,13 +271,19 @@ class SLAM:
   # ------------------------------------------------------------------------------------------------- detection
 
   def detect(self, kf):
+    pts = self.corners(self.img, self.tr_uv)
+    if len(pts):
+      ids = self.map.add_points(kf, pts.astype(np.float64))
+      self.add_tracks(ids, pts, pts.astype(np.float64))
+
+  def corners(self, img, tracked):
+    '''the strongest min-eigenvalue corner of every grid cell without a track'''
     c = self.c
-    img = self.img
     h, w = img.shape
     cell = int(np.ceil(w / c.cells))
     ny, nx = -(-h // cell), -(-w // cell)
     occupied = np.zeros((ny, nx), bool)
-    uv = self.tr_uv.astype(int)
+    uv = tracked.astype(int)
     occupied[np.clip(uv[:, 1] // cell, 0, ny - 1), np.clip(uv[:, 0] // cell, 0, nx - 1)] = True
     score = cv2.cornerMinEigenVal(cv2.GaussianBlur(img, (3, 3), 0) if c.detect_blur else img, 3, 3)
     b = 8
@@ -287,13 +295,11 @@ class SLAM:
     best_score = np.take_along_axis(blocks, best[..., None], axis=2)[..., 0]
     cy, cx = np.nonzero(~occupied & (best_score > c.min_quality * score.max()))
     if len(cy) == 0:
-      return
+      return np.zeros((0, 2), np.float32)
     by, bx = np.divmod(best[cy, cx], cell)
     pts = np.stack([cx * cell + bx, cy * cell + by], axis=1).astype(np.float32)
-    pts = cv2.cornerSubPix(img, pts.reshape(-1, 1, 2), (3, 3), (-1, -1),
-                           (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)).reshape(-1, 2)
-    ids = self.map.add_points(kf, pts.astype(np.float64))
-    self.add_tracks(ids, pts, pts.astype(np.float64))
+    return cv2.cornerSubPix(img, pts.reshape(-1, 1, 2), (3, 3), (-1, -1),
+                            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)).reshape(-1, 2)
 
   # ------------------------------------------------------------------------------------------------- keyframes
 
@@ -592,6 +598,45 @@ class SLAM:
     m.kfs.parent[kf0] = m.kfs.parent[self.pre_kfs[0]]
     m.kfs.parent[kf1] = kf0
     self.pre_kfs = []
+
+  def lost_rotation(self, img):
+    '''
+    while lost: orientation from KLT tracks of its own (the map is not touched), relative to a reference that moves on
+    (with new corners) when fewer than 70% of the tracks survive; the position is held at the last good one. A frame
+    whose tracks do not fit a rotation (fewer than half within pnp_px) keeps the last orientation and starts over with
+    new corners. Returns the pose or None
+    '''
+    c = self.c
+    if self.rt is None:      # just lost: start from the map tracks, relative to the last keyframe
+      has = np.isfinite(self.tr_kf_uv).all(axis=1)
+      T_ref = make_pose(self.map.kfs.T[self.last_kf][:3, :3], np.zeros(3))
+      T_ref[:3, 3] = -T_ref[:3, :3] @ camera_center(self.T_good)
+      self.rt = [T_ref, self.tr_kf_uv[has], self.tr_uv[has].astype(np.float32), int(has.sum()), None]
+    else:
+      T_ref, uv_ref, uv, n0, T_last = self.rt
+      guess = uv + self.shift if getattr(self, 'shift', None) is not None else None
+      uv, ok = self.klt(self.img, img, uv, guess)
+      self.rt = [T_ref, uv_ref[ok], uv[ok], n0, T_last]
+    T_ref, uv_ref, uv, n0, T_last = self.rt
+    T = None
+    if len(uv) >= c.pnp_min_inliers:
+      R, res = self.rotation_only(uv_ref, uv.astype(np.float64))
+      inl = res <= c.pnp_px
+      if inl.sum() >= max(c.pnp_min_inliers, 0.5 * len(uv)):
+        T = make_pose(R, np.zeros(3)) @ T_ref
+        uv_ref, uv = uv_ref[inl], uv[inl]
+    if T is None:       # no rotation fits: keep the last orientation, new corners from here
+      T = T_last
+      if T is None:
+        self.rt = None
+        return None
+      uv = np.zeros((0, 2), np.float32)
+      n0 = 0
+    self.rt = [T_ref, uv_ref, uv, n0, T]
+    if len(uv) < max(c.init_min_points, c.kf_tracked_ratio * n0):    # new reference, new corners
+      uv = np.r_[uv, self.corners(img, uv)].astype(np.float32)
+      self.rt = [T, uv.astype(np.float64), uv, len(uv), T]
+    return T
 
   def rotation_only_pose(self):
     '''the current pose if the camera only rotated since the last keyframe (None: too few tracks)'''
@@ -1258,6 +1303,7 @@ class SLAM:
       T_pred = self.predict(T_prev)
       with self.timed('klt'):
         self.track(img, T_pred, pyr)
+        T_rot = self.lost_rotation(img) if self.rt is not None and c.lost_rotation else None
       self.img, self.pyr = img, pyr
       if self.initializing:
         with self.timed('init'):
@@ -1283,7 +1329,7 @@ class SLAM:
           ok = self.estimate_pose(T_pred)
         if not ok or self.mapped_tracks().sum() < c.reloc_min_3d:
           with self.timed('relocalize'):
-            ok = self.relocalize(self.T_cw if ok else T_pred) or ok
+            ok = self.relocalize(self.T_cw if ok else (T_rot if T_rot is not None else T_pred)) or ok
         if ok and c.track_local_map:
           with self.timed('local_map'):
             self.track_local_map()
@@ -1292,6 +1338,7 @@ class SLAM:
           self.acceleration = velocity @ inv_pose(self.velocity)
           self.velocity = velocity
           self.lost = 0
+          self.rt = None
           self.T_good = self.T_cw.copy()
           m3 = self.mapped_tracks()
           self.good_depth = float(np.median(transform(self.T_cw, self.map.pts.X[self.tr_pt[m3]])[:, 2]))
@@ -1300,6 +1347,12 @@ class SLAM:
           self.T_cw = T_pred if self.lost <= 3 else self.T_good
           if self.lost > 3:
             self.velocity = np.eye(4)
+          if c.lost_rotation:
+            if self.rt is None:
+              T_rot = self.lost_rotation(img)
+            if T_rot is not None:
+              self.T_cw = T_rot
+              self.velocity = np.eye(4)
           if c.reinit and self.lost > c.reinit_after:
             self.start_segment()
         self.epipolar_filter()
@@ -1309,7 +1362,7 @@ class SLAM:
           self.diag['keyframe'] = True
 
     m = self.map
-    if self.initialized and not self.lost and not self.initializing:
+    if self.initialized and not self.initializing and (not self.lost or (c.lost_rotation and self.rt is not None)):
       self.traj.add(1, frame=index, ref=self.last_kf, T=self.T_cw @ inv_pose(m.kfs.T[self.last_kf]),
                     online=inv_pose(self.T_cw))
     self.stats.add(1, frame=index, tracks=len(self.tr_pt), mapped=int(self.mapped_tracks().sum()),
