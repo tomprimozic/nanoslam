@@ -3,7 +3,6 @@ Conventions: T_cw is a 4x4 world-to-camera transform (x_c = R x_w + t); T_wc = i
 Sim3 transforms are 4x4 matrices with the scale folded into the rotation block (x -> s R x + t).
 '''
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 
 def make_pose(R, t):
@@ -75,20 +74,6 @@ def sim3_to_se3(S):
   '''the SE3 pose of a camera whose world-to-camera Sim3 is S (x_c = s R x_w + t ~ R x_w + t / s up to scale)'''
   s = sim3_scale(S)
   return make_pose(S[:3, :3] / s, S[:3, 3] / s)
-
-
-def sim3_log(S):
-  '''(rotvec, t, log s), batched'''
-  s = sim3_scale(S)
-  return np.concatenate([Rotation.from_matrix(S[..., :3, :3] / s[..., None, None]).as_rotvec(),
-                         S[..., :3, 3], np.log(s)[..., None]], axis=-1)
-
-
-def sim3_exp(p):
-  S = np.tile(np.eye(4), p.shape[:-1] + (1, 1))
-  S[..., :3, :3] = np.exp(p[..., 6])[..., None, None] * Rotation.from_rotvec(p[..., :3]).as_matrix()
-  S[..., :3, 3] = p[..., 3:6]
-  return S
 
 
 def umeyama(A, B):

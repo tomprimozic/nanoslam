@@ -74,6 +74,8 @@ class Config:
   # triangulation
   tri_min_angle = 1.0               # deg
   tri_max_px = 3.0
+  tri_ray_gate = True               # a candidate whose solution fails is only dropped when its rays have the parallax
+                                    # (else: a noisy far point, it keeps collecting observations)
 
   # keyframes
   kf_parallax = 1.75                # deg, rotation-compensated median
@@ -149,7 +151,7 @@ class SLAM:
     self.anchor = -1                  # the one the translation test is relative to
     self.window_pose = None           # T_cw of the current frame from the window BA (translation established)
     self.provisional = None           # a map part of unknown scale since a junction keyframe: (junction, first keyframe,
-                                      # mask of the points mapped before)
+                                      # ids of the points mapped before)
     self.init_n_tracks = 0            # tracks right after the last of them
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
@@ -409,7 +411,7 @@ class SLAM:
     row_all = np.full(len(m.pts), -1)
     row_all[tr_pt] = np.arange(len(tr_pt))
     ref_all = ref
-    X, _, _, depth = optim.triangulate(self.K, np.array([np.eye(4), T_last]), np.r_[np.zeros(n, int), np.ones(n, int)],
+    X, _, _, depth, _ = optim.triangulate(self.K, np.array([np.eye(4), T_last]), np.r_[np.zeros(n, int), np.ones(n, int)],
                                        np.r_[np.arange(n), np.arange(n)], np.r_[ref[inl], cur[inl]], n)
     ok = np.isfinite(X).all(axis=1) & (depth > 0)
     if ok.sum() < c.init_min_points:
@@ -535,7 +537,7 @@ class SLAM:
     self.drop_pre_keyframes(kf0, kf1)
     resumed = self.initialized
     if resumed and n_scale < c.resume_scale_points and self.provisional is None:
-      self.provisional = (kf0, kf1, ~new_mask)
+      self.provisional = (kf0, kf1, np.flatnonzero(~new_mask & (m.pts.state == MAPPED)))
     self.initialized, self.initializing, self.lost = True, False, 0
     self.local_ba(kf1)
     self.detect(kf1)
@@ -852,6 +854,7 @@ class SLAM:
       d, j = scipy.spatial.cKDTree(self.tr_uv).query(uv)
       near = d <= self.c.fuse_px
     # at most one found point per track
+    near &= pts != self.tr_pt[j] if len(self.tr_pt) else near     # (already the track's point: nothing to fuse)
     near_idx = np.flatnonzero(near)
     _, first = np.unique(j[near_idx], return_index=True)
     take = near_idx[first]
@@ -868,11 +871,12 @@ class SLAM:
     keep = np.where(keep_a, a, b)
     m.merge(keep, np.where(keep_a, b, a))
     self.tr_pt[jt[~cand]] = keep
-    # everything else becomes a new track
-    new = ~near
+    # everything else becomes a new track (unless it is tracked already)
+    tracked = np.zeros(len(m.pts), bool)
+    tracked[self.tr_pt] = True
+    new = ~near & ~tracked[pts]
     m.add_obs(kf, pts[new], uv[new])
     self.add_tracks(pts[new], uv[new], uv[new])
-    return int(new.sum() + len(take))
 
   # ------------------------------------------------------------------------------------------------- mapping
 
@@ -888,13 +892,14 @@ class SLAM:
       ks = np.unique(m.obs.kf[o])
       kf_row = np.full(len(m.kfs), -1)
       kf_row[ks] = np.arange(len(ks))
-      X, angle, err, depth = optim.triangulate(self.K, m.kfs.T[ks], kf_row[m.obs.kf[o]], row[m.obs.pt[o]],
-                                               m.obs.uv[o], len(cand))
+      X, angle, err, depth, rays = optim.triangulate(self.K, m.kfs.T[ks], kf_row[m.obs.kf[o]], row[m.obs.pt[o]],
+                                                     m.obs.uv[o], len(cand))
       ok = np.isfinite(X).all(axis=1) & (depth > 0) & (err <= c.tri_max_px)
       enough = ok & (angle >= np.deg2rad(c.tri_min_angle))
       m.pts.X[cand[enough]] = X[enough]
       m.pts.state[cand[enough]] = MAPPED
-      m.kill(cand[~ok])
+      # a failed solution: inconsistent observations if the rays have the parallax, else just noise on a far point
+      m.kill(cand[~ok & (rays >= np.deg2rad(c.tri_min_angle))] if c.tri_ray_gate else cand[~ok])
     # candidates that are not tracked anymore can't collect more parallax
     lost = np.flatnonzero((m.pts.state == CANDIDATE) & ~tracked)
     m.kill(lost)
@@ -1014,7 +1019,8 @@ class SLAM:
     m.kfs.T[kfs] = T
     m.pts.X[pts] = X
     m.remove_obs(o[~(e2 <= optim.CHI2_2D)])
-    self.T_cw = m.kfs.T[self.last_kf].copy()
+    if m.kfs.frame[self.last_kf] == self.frame:     # (the current frame is that keyframe: its pose is the live one)
+      self.T_cw = m.kfs.T[self.last_kf].copy()
     # tracks lose their point if it died or its observation in the current keyframe was removed
     o = m.obs_of(kfs=[self.last_kf])
     has = np.zeros(len(m.pts), bool)
@@ -1134,9 +1140,7 @@ class SLAM:
     old_kfs = np.flatnonzero(m.kfs.alive[:first])
     self.cursor += c.reloc_keyframes
     for k in old_kfs[(self.cursor + np.arange(c.reloc_keyframes)) % len(old_kfs)]:
-      cand = m.points_of(k)
-      cand = cand[cand < len(old_pts)]
-      cand = cand[old_pts[cand]]
+      cand = np.setdiff1d(np.intersect1d(m.points_of(k), old_pts), self.tr_pt)     # (untracked old points)
       pts, uv = self.search(m.kfs.T[k], self.pyr, cand, 3, 8, np.inf)
       if len(pts) < 2 * c.loop_min_matches:
         continue
@@ -1180,8 +1184,7 @@ class SLAM:
     part = np.flatnonzero(m.kfs.alive)
     part = part[part >= first]
     m.kfs.T[part] = move(m.kfs.T[part])
-    p = np.flatnonzero(m.pts.state == MAPPED)
-    p = p[(p >= len(old_pts)) | ~old_pts[np.minimum(p, len(old_pts) - 1)]]
+    p = np.setdiff1d(np.flatnonzero(m.pts.state == MAPPED), old_pts)
     m.pts.X[p] = s * m.pts.X[p] @ R_S.T + t_S
     i = np.flatnonzero(self.traj.ref >= first)
     self.traj.T[i, :3, 3] *= s
@@ -1200,16 +1203,10 @@ class SLAM:
       if inl.sum() < c.loop_min_inliers:
         return
       pts, uv = pts[inl], uv[inl]
-    # 1. scale drift: depth of the old points (loop pose) vs nearby current points (current pose)
-    cur = m.points_of(kf)
-    o = m.obs_of(kfs=[kf], pts=cur)
-    cur_uv, cur_depth = m.obs.uv[o], transform(m.kfs.T[kf], m.pts.X[m.obs.pt[o]])[:, 2]
-    old_depth = transform(T_loop, m.pts.X[pts])[:, 2]
-    d, i = scipy.spatial.cKDTree(cur_uv).query(uv)
-    close = d < 10
-    if close.sum() < 5:
+    # 1. scale drift
+    s = self.loop_scale(kf, T_loop, pts, uv)
+    if s is None:
       return
-    s = float(np.median(old_depth[close] / cur_depth[i[close]]))
     # 2. Sim3 pose graph over the alive keyframes: spanning tree + covisibility + loop edges
     alive = np.flatnonzero(m.kfs.alive)
     row = np.full(len(m.kfs), -1)
@@ -1244,6 +1241,7 @@ class SLAM:
     m.pts.X[p] = np.einsum('nij,nj->ni', M[:, :3, :3], m.pts.X[p]) + M[:, :3, 3]
     moved = np.linalg.norm(camera_center(sim3_to_se3(S_new[row[kf]])) - camera_center(m.kfs.T[kf]))
     m.kfs.T[alive] = np.array([sim3_to_se3(Sn) for Sn in S_new])
+    self.T_good = m.kfs.T[kf].copy()
     i = np.flatnonzero(row[self.traj.ref] >= 0)
     self.traj.T[i, :3, 3] /= np.array([sim3_scale(Sn) for Sn in S_new])[row[self.traj.ref[i]], None]
     self.T_cw = m.kfs.T[kf].copy()
