@@ -46,8 +46,13 @@ class Config:
   # initialization
   # (batch BA over the frames since the anchor keyframe, see try_initialize)
   init_window = 20                  # frames in the window BA (subsampled)
-  init_check_parallax = 0.5         # deg, median parallax before a window init is attempted
-  init_ratio = 2.0                  # translation established: likelihood ratio full vs rotation-only > this x extra params
+  init_check_parallax = 0.0         # deg, median parallax before a window test is attempted (0: every frame)
+  init_test = 'marginal'            # translation test: 'marginal' (slamfold: depths integrated out, the null is
+                                    # 1.5 x 3(W-1)/2 nats) or 'map' (MAP depths, null = the extra parameters)
+  init_ratio = 2.0                  # translation established: likelihood ratio full vs rotation-only > this x the null
+  init_seed = 'angle'               # map seeding: 'angle' (>= tri_min_angle of parallax, init_min_points and
+                                    # init_min_ratio) or 'resolved' depths (posterior std < 20% of the mean, marginal
+                                    # test only: maps from 1-5 mm baselines on real data, early error 2x)
   rotation_only_poses = True        # before translation is established: emit rotation-only poses (position held)
   window_poses = True               # translation established but too little parallax for the map yet: emit the window BA's pose
   init_min_points = 50
@@ -323,6 +328,39 @@ class SLAM:
   # ------------------------------------------------------------------------------------------------- initialization
 
 
+  def translation_test(self, T, R_rot, X, cam, pt, uv, host_uv, res_rot):
+    '''
+    slamfold's test: likelihood ratio of the full model (window BA rotations and translation directions, every
+    landmark's inverse depth integrated out under a flat prior, its host bearing integrated by Laplace; the
+    translation magnitude - the prior's support in the BA's gauge - at its optimum) vs the nested rotation-only model,
+    in units of the noise level (from the rotation-only residuals); the null is 1.5 x half a nat per extra
+    pose parameter. Returns the ratio, the null and which landmarks have a resolved depth (posterior std < 20% of the
+    mean)
+    '''
+    n, W = len(X), len(T)
+    # noise level from the rotation-only residuals (host and frame noise: variance 2 sigma^2; median |r| = 1.1774 x
+    # the per-axis sigma in 2D): unbiased without translation, larger with it (the test is then conservative)
+    sigma = max(np.median(res_rot) / 1.1774 / np.sqrt(2), 0.02)
+    b = unproject(self.K, host_uv)
+    b /= np.linalg.norm(b, axis=1, keepdims=True)
+    B = np.zeros((n, 3, 2))
+    a = np.where(np.abs(b[:, :1]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]])
+    B[:, :, 0] = np.cross(b, a)
+    B[:, :, 0] /= np.linalg.norm(B[:, :, 0], axis=1, keepdims=True)
+    B[:, :, 1] = np.cross(b, B[:, :, 0])
+    order = np.argsort(pt, kind='stable')
+    start = np.searchsorted(pt[order], np.arange(n + 1)).astype(np.int64)
+    cam_s, uv_s = cam[order].astype(np.int64), np.ascontiguousarray(uv[order], dtype=np.float64)
+    rho_map = np.where(X[:, 2] > 0, 1 / np.linalg.norm(X, axis=1), 0.0)
+    rho_ref = max(float(np.median(rho_map[rho_map > 0])) if (rho_map > 0).any() else 1.0, 1e-9)
+    log_int, mean, std = optim.depth_integrated(T[:, :3, :3], T[:, :3, 3], b, B, cam_s, uv_s, start, self.K, sigma,
+                                                rho_ref)
+    f, c = np.array([self.K[0, 0], self.K[1, 1]]), np.array([self.K[0, 2], self.K[1, 2]])
+    E_rot = optim.landmark_costs(np.ascontiguousarray(R_rot), np.zeros((W, 3)), b, B, cam_s, uv_s, start, f, c, sigma,
+                                 optim.HUBER, np.zeros((n, 1)))[:, 0]
+    dF = float(np.sum(E_rot + log_int))
+    return dF, 1.5 * 3 * (W - 1) / 2, (std < 0.2 * mean) & (mean > 0)
+
   def rotation_only(self, uv_ref, uv, iterations=3):
     '''
     rotation R (x = R x_ref) that best explains the bearings of a pure rotation (Wahba, IRLS with a Huber weight);
@@ -398,10 +436,11 @@ class SLAM:
     T = np.tile(np.eye(4), (len(frames), 1, 1))
     res_rot = []
     par = []
+    R_rot = np.zeros((len(frames), 3, 3))
     for j in range(len(frames)):
       o = cam == j
       R, res = self.rotation_only(ref_of[o], uv[o])
-      T[j, :3, :3] = R
+      T[j, :3, :3] = R_rot[j] = R
       res_rot.append(res)
       par.append(np.median(np.linalg.norm(uv[o] - ref_of[o], axis=1)))
     par = np.array(par)
@@ -415,12 +454,16 @@ class SLAM:
                                      scale_fix=(len(frames) - 1, int(np.argmax(np.abs(baseline)))))
     # translation test: likelihood ratio of the full model vs the rotation-only one (robust costs in units of the
     # full model's residual scale), against the parameters the full model has in addition (translations + depths)
-    sigma = max(1.4826 * np.median(np.sqrt(e2[np.isfinite(e2)])), 0.1)
-    rr = np.concatenate(res_rot) / sigma
-    rf = np.sqrt(np.minimum(e2, 1e6)) / sigma
-    huber = lambda r: np.where(r <= optim.HUBER, 0.5 * r ** 2, optim.HUBER * (r - 0.5 * optim.HUBER))
-    dF = float(huber(rr).sum() - huber(rf).sum())
-    extra = 3 * (len(frames) - 1) + n
+    W = len(frames)
+    if c.init_test == 'map':
+      sigma = max(1.4826 * np.median(np.sqrt(e2[np.isfinite(e2)])), 0.1)
+      rr = np.concatenate(res_rot) / sigma
+      rf = np.sqrt(np.minimum(e2, 1e6)) / sigma
+      huber = lambda r: np.where(r <= optim.HUBER, 0.5 * r ** 2, optim.HUBER * (r - 0.5 * optim.HUBER))
+      dF = float(huber(rr).sum() - huber(rf).sum())
+      null = 3 * (W - 1) + n
+    else:
+      dF, null, resolved = self.translation_test(T, R_rot, X, cam, pt, uv, ref[inl], np.concatenate(res_rot)[cam > 0])
     # per point: inlier in the first and the last frame (a glitch in an intermediate frame is just a lost observation),
     # in front, parallax
     bad = np.zeros(n, bool)
@@ -433,8 +476,13 @@ class SLAM:
       cos = np.sum(a * b, axis=1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12)
       angle = np.maximum(angle, np.arccos(np.clip(cos, -1, 1)))
     good = ~bad & (X[:, 2] > 0)
-    good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
-    self.diag['init_ratio'] = dF / extra
+    if c.init_test == 'map' or c.init_seed == 'angle':
+      good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
+      enough = good_angle.sum() >= max(c.init_min_points, c.init_min_ratio * good.sum())
+    else:     # the map is seeded with the landmarks whose depth is resolved
+      good_angle = good & resolved
+      enough = good_angle.sum() >= c.init_min_points
+    self.diag['init_ratio'] = dF / null
     # scale: the depths of the anchor's map points next to the new points in its image (the same point, or a
     # neighbour within 10 px), else the depth seen before. A heuristic (depth is assumed locally smooth; the number of
     # pairs does not make the scale reliable, only less often far off)
@@ -450,10 +498,9 @@ class SLAM:
     T[:, :3, 3] *= s
     X = X * s
     T0 = m.kfs.T[kf0]
-    if dF >= c.init_ratio * extra and c.window_poses:
+    if dF >= c.init_ratio * null and c.window_poses:
       self.window_pose = T[-1] @ T0     # translation is established (the map still waits for parallax)
-    if (dF < c.init_ratio * extra or good_angle.sum() < c.init_min_points
-        or good_angle.sum() < c.init_min_ratio * good.sum()):
+    if dF < c.init_ratio * null or not enough:
       return
     self.T_cw = self.T_good = T[-1] @ T0
     self.velocity = np.eye(4)
@@ -491,7 +538,7 @@ class SLAM:
     self.detect(kf1)
     self.kf_n3d = int(self.mapped_tracks().sum())
     self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
-    self.events.append({'type': 'init' if not resumed else 'resume', 'frame': self.frame, 'points': int(len(good_pts)), 'frames': len(frames), 'ratio': dF / extra, 'scale_from': n_scale})
+    self.events.append({'type': 'init' if not resumed else 'resume', 'frame': self.frame, 'points': int(len(good_pts)), 'frames': len(frames), 'ratio': dF / null, 'scale_from': n_scale})
 
   def reset(self):
     self.map = Map()

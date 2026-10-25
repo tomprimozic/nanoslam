@@ -297,6 +297,118 @@ def _refine_pose(R, t, X, uv, f, c, delta, iterations):
   return R, t
 
 
+@njit(cache=True, nogil=True)
+def landmark_costs(R, t, b, B, cam, uv, start, f, c, sigma, delta, rho):
+  '''
+  depth-integrated landmark likelihoods (slamfold): landmark i with host bearing b_i (tangent basis B_i), inverse depth
+  rho_ig at grid node g, seen in frame j at x_ij = R_j (b_i + B_i db) + rho_ig t_j. Returns E[i, g] = -log of the
+  likelihood with the bearing correction db integrated out (Laplace: the robust cost at the best db + 1/2 log det of
+  its Hessian), residuals in units of sigma, Huber at delta. Observations of landmark i: start[i]:start[i + 1]
+  (the host observation among them: it is the prior of db)
+  '''
+  n, G = rho.shape
+  E = np.zeros((n, G))
+  m = 0
+  for i in range(n):
+    m = max(m, start[i + 1] - start[i])
+  Rb = np.zeros((m, 3))
+  RB = np.zeros((m, 3, 2))
+  for i in range(n):
+    k0, k1 = start[i], start[i + 1]
+    for o in range(k0, k1):     # R_j b_i and R_j B_i do not depend on the depth or the bearing correction
+      j = cam[o]
+      for r in range(3):
+        Rb[o - k0, r] = R[j, r, 0] * b[i, 0] + R[j, r, 1] * b[i, 1] + R[j, r, 2] * b[i, 2]
+        for q in range(2):
+          RB[o - k0, r, q] = R[j, r, 0] * B[i, 0, q] + R[j, r, 1] * B[i, 1, q] + R[j, r, 2] * B[i, 2, q]
+    db0, db1 = 0.0, 0.0
+    for g in range(G):
+      for it in range(4):
+        h00, h01, h11, g0, g1, e = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        for o in range(k0, k1):
+          q = o - k0
+          j = cam[o]
+          x0 = Rb[q, 0] + RB[q, 0, 0] * db0 + RB[q, 0, 1] * db1 + rho[i, g] * t[j, 0]
+          x1 = Rb[q, 1] + RB[q, 1, 0] * db0 + RB[q, 1, 1] * db1 + rho[i, g] * t[j, 1]
+          x2 = Rb[q, 2] + RB[q, 2, 0] * db0 + RB[q, 2, 1] * db1 + rho[i, g] * t[j, 2]
+          if x2 <= 1e-9:
+            e += BEHIND
+            continue
+          r0 = (f[0] * x0 / x2 + c[0] - uv[o, 0]) / sigma
+          r1 = (f[1] * x1 / x2 + c[1] - uv[o, 1]) / sigma
+          e2 = r0 * r0 + r1 * r1
+          w = robust_weight(e2, delta)
+          e += robust_cost(e2, delta)
+          a00, a02 = f[0] / (x2 * sigma), -f[0] * x0 / (x2 * x2 * sigma)
+          a11, a12 = f[1] / (x2 * sigma), -f[1] * x1 / (x2 * x2 * sigma)
+          j00, j01 = a00 * RB[q, 0, 0] + a02 * RB[q, 2, 0], a00 * RB[q, 0, 1] + a02 * RB[q, 2, 1]
+          j10, j11 = a11 * RB[q, 1, 0] + a12 * RB[q, 2, 0], a11 * RB[q, 1, 1] + a12 * RB[q, 2, 1]
+          h00 += w * (j00 * j00 + j10 * j10)
+          h01 += w * (j00 * j01 + j10 * j11)
+          h11 += w * (j01 * j01 + j11 * j11)
+          g0 += w * (j00 * r0 + j10 * r1)
+          g1 += w * (j01 * r0 + j11 * r1)
+        det = h00 * h11 - h01 * h01 + 1e-12
+        if it == 3:
+          E[i, g] = e + 0.5 * np.log(det)
+          break
+        db0 -= (h11 * g0 - h01 * g1) / det
+        db1 -= (h00 * g1 - h01 * g0) / det
+  return E
+
+
+def depth_integrated(R, t, b, B, cam, uv, start, K, sigma, rho_ref):
+  '''
+  per landmark: the likelihood integrated over inverse depth with a flat prior on [0, U], for the support U that
+  maximizes the total (scaling the translations by k is scaling U by k: this is the optimum of the translation
+  magnitude, which the BA's gauge fixed). Returns the per-landmark log integrals and the posterior mean / std of rho
+  at that U. rho_ref: a typical inverse depth (the grid spans 1e-5 .. 300 x it, refined around each posterior)
+  '''
+  f, c = np.array([K[0, 0], K[1, 1]]), np.array([K[0, 2], K[1, 2]])
+  args = (np.ascontiguousarray(R), np.ascontiguousarray(t), b, B, cam, uv, start, f, c, sigma, HUBER)
+  n = len(b)
+  base = np.r_[0.0, rho_ref * np.logspace(-5, 2.5, 64)]
+  grid = np.tile(base, (n, 1))
+  E = landmark_costs(*args, grid)
+  # refine around each landmark's best node: +-6 widths (from the curvature there, at least the local grid step)
+  best = np.argmin(E, axis=1)
+  ii = np.arange(n)
+  k = np.clip(best, 1, grid.shape[1] - 2)
+  h = (grid[ii, k + 1] - grid[ii, k - 1]) / 2
+  curv = (E[ii, k + 1] - 2 * E[ii, k] + E[ii, k - 1]) / h ** 2
+  width = np.clip(np.where(curv > 0, 1 / np.sqrt(np.maximum(curv, 1e-300)), h), 1e-3 * h, h)
+  fine = np.maximum(grid[ii, best][:, None] + width[:, None] * np.linspace(-6, 6, 25), 0)
+  grid, E = np.c_[grid, fine], np.c_[E, landmark_costs(*args, fine)]
+  order = np.argsort(grid, axis=1)
+  grid, E = np.take_along_axis(grid, order, 1), np.take_along_axis(E, order, 1)
+  # cumulative integral of exp(-E) (trapezoid, in units of exp(-E0) for stability), then the average over [0, U]
+  E0 = E.min(axis=1, keepdims=True)
+  L = np.exp(-(E - E0))
+  cum = np.c_[np.zeros(n), np.cumsum(np.diff(grid, axis=1) * (L[:, 1:] + L[:, :-1]) / 2, axis=1)]
+  supports = rho_ref * np.logspace(-5, 2.5, 76)
+  U = supports[:, None]
+  j = np.minimum((grid[None] < U[..., None]).sum(axis=2), grid.shape[1] - 1)     # (supports, landmarks)
+  jl = np.maximum(j - 1, 0)
+  g_l, g_r = np.take_along_axis(grid, jl.T, 1).T, np.take_along_axis(grid, j.T, 1).T
+  L_l, L_r = np.take_along_axis(L, jl.T, 1).T, np.take_along_axis(L, j.T, 1).T
+  a_ = np.clip((U - g_l) / np.maximum(g_r - g_l, 1e-300), 0, 1)
+  C = np.take_along_axis(cum, jl.T, 1).T + (U - g_l).clip(0, None) * (2 * L_l + a_ * (L_r - L_l)) / 2
+  C = np.where(U >= grid[:, -1][None], cum[:, -1][None], C)
+  log_avg = np.log(np.maximum(C, 1e-300)) - np.log(U) - E0[:, 0][None]
+  q = int(np.argmax(log_avg.sum(axis=1)))
+  U = supports[q]
+  inside = grid <= U
+  w = np.zeros_like(grid)
+  dg = np.diff(grid, axis=1)
+  w[:, :-1] += dg / 2
+  w[:, 1:] += dg / 2
+  p = np.where(inside, L * w, 0)
+  p /= np.maximum(p.sum(axis=1, keepdims=True), 1e-300)
+  mean = np.sum(p * grid, axis=1)
+  std = np.sqrt(np.maximum(np.sum(p * grid ** 2, axis=1) - mean ** 2, 0))
+  return log_avg[q], mean, std
+
+
 def refine_pose(K, T_cw, X, uv, iterations=10, delta=HUBER):
   '''motion-only Gauss-Newton; returns T_cw and the squared reprojection errors'''
   f, c = np.array([K[0, 0], K[1, 1]]), np.array([K[0, 2], K[1, 2]])
