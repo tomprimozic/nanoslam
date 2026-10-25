@@ -532,6 +532,46 @@ def perturb(s, R, t, d):
 
 
 @njit(cache=True, nogil=True)
+def _edge_error(si, Ri, ti, sj, Rj, tj, sm, Rm, tm, r, E):
+  '''sim3_edge_error without allocations: r (7,) gets the residual, E (3, 3) is scratch'''
+  s_ij = si / sj
+  # R_ij = Ri Rj^T, t_ij = ti - s_ij R_ij tj, E = Rm^T R_ij
+  Rij = E     # (scratch: R_ij)
+  for p in range(3):
+    for q in range(3):
+      Rij[p, q] = Ri[p, 0] * Rj[q, 0] + Ri[p, 1] * Rj[q, 1] + Ri[p, 2] * Rj[q, 2]
+  d0 = ti[0] - s_ij * (Rij[0, 0] * tj[0] + Rij[0, 1] * tj[1] + Rij[0, 2] * tj[2]) - tm[0]
+  d1 = ti[1] - s_ij * (Rij[1, 0] * tj[0] + Rij[1, 1] * tj[1] + Rij[1, 2] * tj[2]) - tm[1]
+  d2 = ti[2] - s_ij * (Rij[2, 0] * tj[0] + Rij[2, 1] * tj[1] + Rij[2, 2] * tj[2]) - tm[2]
+  for p in range(3):
+    r[3 + p] = (Rm[0, p] * d0 + Rm[1, p] * d1 + Rm[2, p] * d2) / sm
+  r[6] = np.log(s_ij / sm)
+  # E = Rm^T R_ij, then its log
+  e00 = Rm[0, 0] * Rij[0, 0] + Rm[1, 0] * Rij[1, 0] + Rm[2, 0] * Rij[2, 0]
+  e01 = Rm[0, 0] * Rij[0, 1] + Rm[1, 0] * Rij[1, 1] + Rm[2, 0] * Rij[2, 1]
+  e02 = Rm[0, 0] * Rij[0, 2] + Rm[1, 0] * Rij[1, 2] + Rm[2, 0] * Rij[2, 2]
+  e10 = Rm[0, 1] * Rij[0, 0] + Rm[1, 1] * Rij[1, 0] + Rm[2, 1] * Rij[2, 0]
+  e11 = Rm[0, 1] * Rij[0, 1] + Rm[1, 1] * Rij[1, 1] + Rm[2, 1] * Rij[2, 1]
+  e12 = Rm[0, 1] * Rij[0, 2] + Rm[1, 1] * Rij[1, 2] + Rm[2, 1] * Rij[2, 2]
+  e20 = Rm[0, 2] * Rij[0, 0] + Rm[1, 2] * Rij[1, 0] + Rm[2, 2] * Rij[2, 0]
+  e21 = Rm[0, 2] * Rij[0, 1] + Rm[1, 2] * Rij[1, 1] + Rm[2, 2] * Rij[2, 1]
+  e22 = Rm[0, 2] * Rij[0, 2] + Rm[1, 2] * Rij[1, 2] + Rm[2, 2] * Rij[2, 2]
+  cos = min(max((e00 + e11 + e22 - 1) / 2, -1.0), 1.0)
+  th = np.arccos(cos)
+  w0, w1, w2 = e21 - e12, e02 - e20, e10 - e01
+  if th < 1e-6:
+    r[0], r[1], r[2] = w0 / 2, w1 / 2, w2 / 2
+  elif th > np.pi - 1e-4:     # near pi: the general path (rare)
+    for p in range(3):
+      E[p, 0], E[p, 1], E[p, 2] = (e00, e01, e02) if p == 0 else ((e10, e11, e12) if p == 1 else (e20, e21, e22))
+    v = so3_log(E)
+    r[0], r[1], r[2] = v[0], v[1], v[2]
+  else:
+    k = th / (2 * np.sin(th))
+    r[0], r[1], r[2] = k * w0, k * w1, k * w2
+
+
+@njit(cache=True, nogil=True)
 def pose_graph_linearize(s, R, t, I, J, sm, Rm, tm, w, var):
   '''per edge residual and numerical Jacobians w.r.t. local increments of both nodes; also the cost'''
   n = len(I)
@@ -540,28 +580,58 @@ def pose_graph_linearize(s, R, t, I, J, sm, Rm, tm, w, var):
   Jj = np.zeros((n, 7, 7))
   eps = 1e-6
   cost = 0.0
+  Q = np.zeros((3, 3, 3))     # exp(eps e_a): the rotation perturbations (left-multiplied, as in perturb)
+  for a in range(3):
+    d = np.zeros(3)
+    d[a] = eps
+    Q[a] = so3_exp(d)
+  E = np.zeros((3, 3))
+  Rp = np.zeros((3, 3))
+  tp = np.zeros(3)
+  rp = np.zeros(7)
   for e in range(n):
     i, j = I[e], J[e]
-    r[e] = sim3_edge_error(s[i], R[i], t[i], s[j], R[j], t[j], sm[e], Rm[e], tm[e])
-    cost += w[e] * np.sum(r[e] ** 2)
-    for a in range(7):
-      d = np.zeros(7)
-      d[a] = eps
-      if var[i] >= 0:
-        si, Ri, ti = perturb(s[i], R[i], t[i], d)
-        Ji[e, :, a] = (sim3_edge_error(si, Ri, ti, s[j], R[j], t[j], sm[e], Rm[e], tm[e]) - r[e]) / eps
-      if var[j] >= 0:
-        sj, Rj, tj = perturb(s[j], R[j], t[j], d)
-        Jj[e, :, a] = (sim3_edge_error(s[i], R[i], t[i], sj, Rj, tj, sm[e], Rm[e], tm[e]) - r[e]) / eps
+    _edge_error(s[i], R[i], t[i], s[j], R[j], t[j], sm[e], Rm[e], tm[e], r[e], E)
+    for q in range(7):
+      cost += w[e] * r[e, q] * r[e, q]
+    for side in range(2):
+      k = i if side == 0 else j
+      if var[k] < 0:
+        continue
+      for a in range(7):
+        sk = s[k]
+        for p in range(3):
+          tp[p] = t[k, p]
+          for q in range(3):
+            Rp[p, q] = R[k, p, q]
+        if a < 3:
+          for p in range(3):
+            for q in range(3):
+              Rp[p, q] = Q[a, p, 0] * R[k, 0, q] + Q[a, p, 1] * R[k, 1, q] + Q[a, p, 2] * R[k, 2, q]
+        elif a < 6:
+          tp[a - 3] += eps
+        else:
+          sk = s[k] * np.exp(eps)
+        if side == 0:
+          _edge_error(sk, Rp, tp, s[j], R[j], t[j], sm[e], Rm[e], tm[e], rp, E)
+          for q in range(7):
+            Ji[e, q, a] = (rp[q] - r[e, q]) / eps
+        else:
+          _edge_error(s[i], R[i], t[i], sk, Rp, tp, sm[e], Rm[e], tm[e], rp, E)
+          for q in range(7):
+            Jj[e, q, a] = (rp[q] - r[e, q]) / eps
   return r, Ji, Jj, cost
 
 
 @njit(cache=True, nogil=True)
 def pose_graph_cost(s, R, t, I, J, sm, Rm, tm, w):
   cost = 0.0
+  E = np.zeros((3, 3))
+  r = np.zeros(7)
   for e in range(len(I)):
-    r = sim3_edge_error(s[I[e]], R[I[e]], t[I[e]], s[J[e]], R[J[e]], t[J[e]], sm[e], Rm[e], tm[e])
-    cost += w[e] * np.sum(r ** 2)
+    _edge_error(s[I[e]], R[I[e]], t[I[e]], s[J[e]], R[J[e]], t[J[e]], sm[e], Rm[e], tm[e], r, E)
+    for q in range(7):
+      cost += w[e] * r[q] * r[q]
   return cost
 
 
@@ -572,6 +642,36 @@ def pose_graph_update(s, R, t, dx, var):
     if var[k] >= 0:
       s[k], R[k], t[k] = perturb(s[k], R[k], t[k], dx[7 * var[k]:7 * var[k] + 7])
   return s, R, t
+
+
+@njit(cache=True, nogil=True)
+def pose_graph_normal(Ji, Jj, r, w, blk, n_blocks, gi, gj, nv):
+  '''normal equations of the pose graph: the 7x7 blocks (in the fixed pattern, blk[e] = slots of ii, jj, ij, ji or -1)
+  and the gradient (gi / gj: the node's variable index or -1)'''
+  H = np.zeros((n_blocks, 7, 7))
+  g = np.zeros(7 * nv)
+  for e in range(len(w)):
+    for k in range(4):
+      q = blk[e, k]
+      if q < 0:
+        continue
+      A = Ji if k == 0 or k == 2 else Jj
+      B = Ji if k == 0 or k == 3 else Jj
+      for p in range(7):
+        for c in range(7):
+          acc = 0.0
+          for m in range(7):
+            acc += A[e, m, p] * B[e, m, c]
+          H[q, p, c] += w[e] * acc
+    for k, (J, v) in enumerate(((Ji, gi[e]), (Jj, gj[e]))):
+      if v < 0:
+        continue
+      for p in range(7):
+        acc = 0.0
+        for m in range(7):
+          acc += J[e, m, p] * r[e, m]
+        g[7 * v + p] += w[e] * acc
+  return H, g
 
 
 def pose_graph(S_cw, edges, fixed, iterations=20):
@@ -592,30 +692,35 @@ def pose_graph(S_cw, edges, fixed, iterations=20):
   Rm, tm = M[:, :3, :3] / sm[:, None, None], M[:, :3, 3].copy()
   var = np.where(fixed, -1, np.cumsum(~fixed) - 1).astype(np.int64)
   nv = int((~fixed).sum())
-  # sparsity pattern of the normal equations (blocks ii, jj, ij, ji)
-  blocks = [(a, b) for a, b in [(I, I), (J, J), (I, J), (J, I)]]
+  # fixed sparsity pattern: one 7x7 block per (variable, variable) pair that an edge (or the diagonal) touches
+  vi, vj = var[I], var[J]
+  pairs = np.r_[np.c_[np.arange(nv), np.arange(nv)], np.c_[vi, vj], np.c_[vj, vi]]
+  pairs = pairs[(pairs >= 0).all(axis=1)]
+  keys, slot = np.unique(pairs[:, 0] * nv + pairs[:, 1], return_inverse=True)
+  bi, bj = keys // nv, keys % nv
+  lookup = dict(zip(keys.tolist(), range(len(keys))))
+  key = lambda a, b: np.array([lookup.get(int(x) * nv + int(y), -1) if x >= 0 and y >= 0 else -1 for x, y in zip(a, b)])
+  blk = np.c_[key(vi, vi), key(vj, vj), key(vi, vj), key(vj, vi)].astype(np.int64)
+  rr, cc = np.meshgrid(np.arange(7), np.arange(7), indexing='ij')
+  rows = (7 * bi)[:, None, None] + rr
+  cols = (7 * bj)[:, None, None] + cc
+  pattern = scipy.sparse.csc_matrix((np.arange(rows.size, dtype=np.float64) + 1, (rows.ravel(), cols.ravel())),
+                                    shape=(7 * nv, 7 * nv))
+  perm = pattern.data.astype(np.int64) - 1      # csc data position -> flat block entry
+  diag = np.flatnonzero(pattern.indices == np.repeat(np.arange(7 * nv), np.diff(pattern.indptr)))
   lam = 1e-4
   r, Ji, Jj, cost = pose_graph_linearize(s, R, t, I, J, sm, Rm, tm, w, var)
   for _ in range(iterations):
-    rows, cols, vals = [], [], []
-    for (A, B), (JA, JB) in zip(blocks, [(Ji, Ji), (Jj, Jj), (Ji, Jj), (Jj, Ji)]):
-      ok = (var[A] >= 0) & (var[B] >= 0)
-      H = np.einsum('nki,nkj->nij', JA[ok] * w[ok, None, None], JB[ok])
-      rr, cc = np.meshgrid(np.arange(7), np.arange(7), indexing='ij')
-      rows.append((7 * var[A[ok]])[:, None, None] + rr)
-      cols.append((7 * var[B[ok]])[:, None, None] + cc)
-      vals.append(H)
-    H = scipy.sparse.coo_matrix((np.concatenate(vals, axis=None), (np.concatenate(rows, axis=None),
-                                np.concatenate(cols, axis=None))), shape=(7 * nv, 7 * nv)).tocsc()
-    g = np.zeros(7 * nv)
-    for A, JA in [(I, Ji), (J, Jj)]:
-      ok = var[A] >= 0
-      np.add.at(g, (7 * var[A[ok]])[:, None] + np.arange(7), np.einsum('nki,nk->ni', JA[ok] * w[ok, None, None], r[ok]))
-    diag = H.diagonal()
+    Hb, g = pose_graph_normal(Ji, Jj, r, w, blk, len(keys), vi, vj, nv)
+    H = pattern.copy()
+    H.data = Hb.reshape(-1)[perm]
+    d = H.data[diag].copy()
     improved = False
     while lam < 1e8:
-      Hd = H + scipy.sparse.diags(lam * diag + 1e-12)
-      dx = scipy.sparse.linalg.spsolve(Hd.tocsc(), -g)
+      H.data[diag] = d * (1 + lam) + 1e-12
+      # (SPD: symmetric mode, no pivoting)
+      dx = scipy.sparse.linalg.splu(H, permc_spec='MMD_AT_PLUS_A', diag_pivot_thresh=0.0,
+                                    options=dict(SymmetricMode=True)).solve(-g)
       s_new, R_new, t_new = pose_graph_update(s, R, t, dx, var)
       new_cost = pose_graph_cost(s_new, R_new, t_new, I, J, sm, Rm, tm, w)
       if np.isfinite(new_cost) and new_cost < cost:
