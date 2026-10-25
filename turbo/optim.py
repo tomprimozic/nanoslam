@@ -12,7 +12,6 @@ import scipy.linalg
 import scipy.optimize
 import scipy.sparse
 from numba import njit
-from scipy.spatial.transform import Rotation
 
 import geometry
 
@@ -32,36 +31,32 @@ def so3_exp(w):
 
 
 @njit(cache=True, nogil=True)
-def robust_weight(e2, delta, loss):
-  '''IRLS weight of a squared residual: Huber (loss 0) or Cauchy (loss 1) with scale delta'''
-  if loss == 1:
-    return 1.0 / (1.0 + e2 / delta ** 2)
+def robust_weight(e2, delta):
+  '''IRLS weight of a squared residual: Huber with scale delta'''
   return 1.0 if e2 <= delta * delta else delta / np.sqrt(e2)
 
 
 @njit(cache=True, nogil=True)
-def robust_cost(e2, delta, loss):
-  if loss == 1:
-    return 0.5 * delta ** 2 * np.log1p(e2 / delta ** 2)
+def robust_cost(e2, delta):
   return 0.5 * e2 if e2 <= delta * delta else delta * (np.sqrt(e2) - 0.5 * delta)
 
 
 @njit(cache=True, nogil=True)
-def reprojection_cost(R, t, X, cam, pt, uv, wo, f, c, delta, loss):
+def reprojection_cost(R, t, X, cam, pt, uv, f, c, delta):
   cost = 0.0
   for o in range(len(cam)):
     Xc = R[cam[o]] @ X[pt[o]] + t[cam[o]]
     if Xc[2] <= 1e-9:
       cost += BEHIND
       continue
-    rx = (f[0] * Xc[0] / Xc[2] + c[0] - uv[o, 0]) * wo[o]
-    ry = (f[1] * Xc[1] / Xc[2] + c[1] - uv[o, 1]) * wo[o]
-    cost += robust_cost(rx * rx + ry * ry, delta, loss)
+    rx = f[0] * Xc[0] / Xc[2] + c[0] - uv[o, 0]
+    ry = f[1] * Xc[1] / Xc[2] + c[1] - uv[o, 1]
+    cost += robust_cost(rx * rx + ry * ry, delta)
   return cost
 
 
 @njit(cache=True, nogil=True)
-def linearize(R, t, X, cam, pt, uv, wo, free, mask, f, c, delta, loss, n_free):
+def linearize(R, t, X, cam, pt, uv, free, mask, f, c, delta, n_free):
   '''
   normal equations: U (pose blocks), V (point blocks), W (per observation pose-point block), gradients;
   mask (n_free, 6): 0 = this pose parameter is held fixed
@@ -80,13 +75,12 @@ def linearize(R, t, X, cam, pt, uv, wo, free, mask, f, c, delta, loss, n_free):
     x, y, z = Y[0] + t[k, 0], Y[1] + t[k, 1], Y[2] + t[k, 2]
     if z <= 1e-9:
       continue
-    s = wo[o]     # residuals (and Jacobians) in units of the observation's noise
-    r0 = (f[0] * x / z + c[0] - uv[o, 0]) * s
-    r1 = (f[1] * y / z + c[1] - uv[o, 1]) * s
-    w = robust_weight(r0 * r0 + r1 * r1, delta, loss)
+    r0 = f[0] * x / z + c[0] - uv[o, 0]
+    r1 = f[1] * y / z + c[1] - uv[o, 1]
+    w = robust_weight(r0 * r0 + r1 * r1, delta)
     # d proj / d Xc
-    a00, a02 = s * f[0] / z, -s * f[0] * x / z ** 2
-    a11, a12 = s * f[1] / z, -s * f[1] * y / z ** 2
+    a00, a02 = f[0] / z, -f[0] * x / z ** 2
+    a11, a12 = f[1] / z, -f[1] * y / z ** 2
     # pose: d Xc / d w = -[R X]x, d Xc / d v = I
     Jc[0, 0], Jc[0, 1], Jc[0, 2] = a02 * Y[1], a00 * Y[2] - a02 * Y[0], -a00 * Y[1]
     Jc[1, 0], Jc[1, 1], Jc[1, 2] = -a11 * Y[2] + a12 * Y[1], -a12 * Y[0], a11 * Y[0]
@@ -211,14 +205,11 @@ def apply_update(R, t, X, dc, dp, free):
   return R, t, X + dp
 
 
-def bundle_adjust(K, T_cw, fixed, X, cam, pt, uv, iterations=10, delta=HUBER, scale_fix=None, noise=None,
-                  loss='huber'):
+def bundle_adjust(K, T_cw, fixed, X, cam, pt, uv, iterations=10, delta=HUBER, scale_fix=None):
   '''
   T_cw: (n_cams, 4, 4), fixed: (n_cams,) bool, X: (n_pts, 3), observations: cam / pt indices and pixels uv
   scale_fix: (camera, axis): hold this translation component fixed (monocular gauge with a single fixed camera)
-  noise: per observation noise factor (residuals are divided by it; None = 1)
-  returns optimized T_cw, X and the squared reprojection error of every observation (inf if behind the camera), in
-  units of its noise
+  returns optimized T_cw, X and the squared reprojection error of every observation (inf if behind the camera)
   '''
   f, c = np.array([K[0, 0], K[1, 1]]), np.array([K[0, 2], K[1, 2]])
   R, t = T_cw[:, :3, :3].copy(), T_cw[:, :3, 3].copy()
@@ -229,14 +220,12 @@ def bundle_adjust(K, T_cw, fixed, X, cam, pt, uv, iterations=10, delta=HUBER, sc
   if scale_fix is not None:
     mask[free[scale_fix[0]], 3 + scale_fix[1]] = 0
   cam, pt, uv = cam.astype(np.int64), pt.astype(np.int64), uv.astype(np.float64)
-  wo = np.ones(len(cam)) if noise is None else 1.0 / np.asarray(noise, np.float64)
-  loss = {'huber': 0, 'cauchy': 1}[loss]
   order = np.argsort(pt, kind='stable')
   ptr = np.searchsorted(pt[order], np.arange(len(X) + 1))
-  cost = reprojection_cost(R, t, X, cam, pt, uv, wo, f, c, delta, loss)
+  cost = reprojection_cost(R, t, X, cam, pt, uv, f, c, delta)
   lam = 1e-4
   for _ in range(iterations):
-    U, gc, V, gp, W = linearize(R, t, X, cam, pt, uv, wo, free, mask, f, c, delta, loss, n_free)
+    U, gc, V, gp, W = linearize(R, t, X, cam, pt, uv, free, mask, f, c, delta, n_free)
     improved = False
     while lam < 1e8:
       S, b, Vinv = schur(U, gc, V, gp, W, cam, free, ptr, order, lam)
@@ -247,7 +236,7 @@ def bundle_adjust(K, T_cw, fixed, X, cam, pt, uv, iterations=10, delta=HUBER, sc
         continue
       dp = back_substitute(dc, Vinv, gp, W, cam, free, ptr, order)
       R_new, t_new, X_new = apply_update(R, t, X, dc, dp, free)
-      new_cost = reprojection_cost(R_new, t_new, X_new, cam, pt, uv, wo, f, c, delta, loss)
+      new_cost = reprojection_cost(R_new, t_new, X_new, cam, pt, uv, f, c, delta)
       if np.isfinite(new_cost) and new_cost < cost:
         improved = cost - new_cost > 1e-6 * cost
         R, t, X, cost = R_new, t_new, X_new, new_cost
@@ -258,7 +247,7 @@ def bundle_adjust(K, T_cw, fixed, X, cam, pt, uv, iterations=10, delta=HUBER, sc
       break
   T_out = T_cw.copy()
   T_out[:, :3, :3], T_out[:, :3, 3] = R, t
-  return T_out, X, squared_errors(R, t, X, cam, pt, uv, f, c) * wo ** 2
+  return T_out, X, squared_errors(R, t, X, cam, pt, uv, f, c)
 
 
 @njit(cache=True, nogil=True)
@@ -286,7 +275,7 @@ def _refine_pose(R, t, X, uv, f, c, delta, iterations):
         continue
       r0 = f[0] * x / z + c[0] - uv[o, 0]
       r1 = f[1] * y / z + c[1] - uv[o, 1]
-      w = robust_weight(r0 * r0 + r1 * r1, delta, 0)
+      w = robust_weight(r0 * r0 + r1 * r1, delta)
       a00, a02 = f[0] / z, -f[0] * x / z ** 2
       a11, a12 = f[1] / z, -f[1] * y / z ** 2
       J[0, 0], J[0, 1], J[0, 2] = a02 * y, a00 * z - a02 * x, -a00 * y

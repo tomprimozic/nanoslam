@@ -1,7 +1,7 @@
 '''
 The map: flat numpy tables of keyframes, points and observations.
 
-  keyframes     pose T_cw, frame index, parent (spanning tree), segment, alive flag; pyramids in `Map.images`
+  keyframes     pose T_cw, frame index, parent (spanning tree), alive flag; pyramids in `Map.images`
   points        position, state, reference keyframe + pixel (where its patch comes from), observation counts
   observations  (keyframe, point, pixel) triples, with an alive flag; compacted when half of them are dead
 
@@ -62,8 +62,7 @@ class Table:
 class Map:
   def __init__(self):
     self.kfs = Table(T=(np.float64, (4, 4), 0), frame=(np.int64, (), -1), alive=(bool, (), True),
-                     parent=(np.int64, (), -1), segment=(np.int64, (), 0), noise=(np.float64, (), 1.0),
-                     slot=(np.int64, (), -1))
+                     parent=(np.int64, (), -1), slot=(np.int64, (), -1))
     self.images = None     # lk.ImageStore of the keyframe pyramids (kfs.slot)
     self.pts = Table(X=(np.float64, (3,), np.nan), state=(np.int8, (), CANDIDATE), ref=(np.int64, (), -1),
                      ref_uv=(np.float64, (2,), np.nan), n_obs=(np.int32, (), 0), first_kf=(np.int64, (), -1),

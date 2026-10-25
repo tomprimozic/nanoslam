@@ -36,7 +36,7 @@ rotations; 360 / desk2 / rpy are lost after the first seconds (see Next).
 ## How it works
 
 **Map** (`map.py`). Three tables with growable columns (`Table`): keyframes (pose, frame, parent in the spanning tree,
-segment, alive), points (position, state, reference keyframe + pixel, observation / visibility counts) and observations
+alive), points (position, state, reference keyframe + pixel, observation / visibility counts) and observations
 (keyframe, point, pixel). There is no Python object per point: everything is selected with masks and gathered with
 index arrays, and covisibility is a sparse incidence-matrix product. Every detected feature is a point from the start:
 a *candidate* collects keyframe observations while it is tracked and becomes *mapped* when multi-view triangulation
@@ -191,8 +191,8 @@ translation is established positions are held, see Initialization).
   within 1 m with a similar view; seasidetown 13%, but tracking is lost there by then), so full ~ VO there. For
   comparison V1_02 57%, household 97%.
 - On the frames it tracks, V2_03 is ~3 cm ATE; its large numbers come from a ~170 frame stretch through a part of
-  the room that was never mapped, after motion blur (relocalization can't succeed there; `reinit=True` starts a new
-  map segment but rarely merges it correctly). abandonedfactory loses track in its last 10 frames (dark wall, fast),
+  the room that was never mapped, after motion blur (relocalization can't succeed there; the mapless mode
+  continues the map there with a provisional scale). abandonedfactory loses track in its last 10 frames (dark wall, fast),
   seasidetown after frame 100 (0.25 m / frame around a pillar into a dark room, ~10 fps rendering).
 - For orientation only (the numbers vary between papers): ORB-SLAM3 monocular on EuRoC is reported at MH_01
   1.6-2.9 cm, MH_04 8.5-13.8 cm, V2_03 36-52 cm or a failure ([1](https://arxiv.org/pdf/2405.03413),
@@ -234,8 +234,8 @@ the second round: differences below ~10-15% are not resolvable).
 | near-duplicate keyframe culling | 10-30% fewer keyframes, same accuracy (ORB-SLAM's "90% seen by 3 others" culled 90% and broke the scale) | kept |
 | re-measuring candidates too (rotation-only warp) | VO slightly worse | removed |
 | patch source: reference keyframe first (vs most similar view) | VO ensemble worse (ATE 11.0 -> 11.6 cm) | removed |
-| tracking the local map every frame (ORB-SLAM's TrackLocalMap) | VO ensemble neutral (big wins and losses per sequence), 20% slower | option, off |
-| new map segment when lost (re-initialization, merged by a Sim3 loop) | only changes seasidetown (26% -> 83% tracked, still wrong) | option, off |
+| tracking the local map every frame (ORB-SLAM's TrackLocalMap) | VO ensemble neutral (big wins and losses per sequence), 20% slower | removed |
+| new map segment when lost (re-initialization, merged by a Sim3 loop) | only changes seasidetown (26% -> 83% tracked, still wrong) | removed (superseded by the mapless mode) |
 | intensity stretch before CLAHE (dark images) | no effect | removed |
 | VO: ba_window 15, ba_iters 20, 30 cells, kf_parallax 1.0 / 2.5, tri_min_angle 0.5 / 2.0 | none better (the defaults are on a plateau) | - |
 
@@ -251,10 +251,10 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | keep tracking PnP outliers ("soft"), VO | 1.21 [1.05, 1.42] | no |
 | Cauchy instead of Huber in BA, VO | 1.04 [0.86, 1.28] | noise |
 | no keyframe culling, VO | 1.08 [0.96, 1.23] | keep culling |
-| + ORB-style thinning of old keyframes (redundant, > 20 keyframes old), VO | 0.98 [0.86, 1.08], 14% fewer keyframes | option |
-| adaptive thresholds: PnP inliers at the live noise level, VO | 0.94 [0.76, 1.18] | option (`adaptive_pnp`) |
+| + ORB-style thinning of old keyframes (redundant, > 20 keyframes old), VO | 0.98 [0.86, 1.08], 14% fewer keyframes | removed |
+| adaptive thresholds: PnP inliers at the live noise level, VO | 0.94 [0.76, 1.18] | removed |
 | adaptive thresholds: keyframe noise as BA weights, VO | 1.19 [1.07, 1.35] | no |
-| drop tracks that slipped > 2 px at re-measurement, VO, 3 starts | 0.97 | option |
+| drop tracks that slipped > 2 px at re-measurement, VO, 3 starts | 0.97 | removed |
 | no second local BA after fusing old points, full | 1.16 [1.03, 1.33] | keep it |
 | search old points only every 3rd keyframe, full | 0.99 [0.88, 1.12], ~1/3 of the loop search time | adopted |
 | no global BA after loop closures, full | 1.21 [0.92, 1.73], rotation 1.23 [1.04, 1.56] | keep it |
@@ -304,4 +304,4 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
   made: a candidate signal for more keyframes / more points under fast motion;
 - voxel map instead of keyframes for reprojection and loops (search by projection and the old-point search are O(map));
   dense / semi-dense reconstruction;
-- tracking through very fast motion (TartanAir) and re-joining new map segments reliably.
+- tracking through very fast motion (TartanAir).
