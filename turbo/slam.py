@@ -22,7 +22,7 @@ import lk
 import optim
 from map import Map, Table, CANDIDATE, MAPPED, DEAD, group_starts
 from geometry import (make_pose, inv_pose, orthonormalize, transform, camera_center, project, unproject, sim3,
-                      sim3_inv, sim3_to_se3, rotation_angle)
+                      sim3_inv, sim3_scale, sim3_to_se3, rotation_angle)
 
 
 class Config:
@@ -368,7 +368,8 @@ class SLAM:
     '''
     batch BA over the frames since the anchor keyframe (subsampled), started from the rotation-only rotations and the
     two-view translation direction; initialized once the rotation-only model clearly explains the tracks worse than the
-    full one (residual scale ratio, a likelihood ratio without the noise level) and enough points have parallax
+    full one (residual scale ratio, a likelihood ratio without the noise level) and enough points have parallax.
+    (An approximation of slamfold's test: the full model's depths are MAP estimates in a robust cost, not integrated out)
     '''
     c, m = self.c, self.map
     kf0, sub, ref = self.init_anchor()
@@ -458,7 +459,8 @@ class SLAM:
     good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
     self.diag['init_ratio'] = dF / extra
     # scale: the depths of the anchor's map points next to the new points in its image (the same point, or a
-    # neighbour within 10 px: depth is locally smooth), else the depth seen before
+    # neighbour within 10 px), else the depth seen before. A heuristic (depth is assumed locally smooth; the number of
+    # pairs does not make the scale reliable, only less often far off)
     s, n_scale = self.good_depth / np.median(X[good, 2]), 0
     o = m.obs_of(kfs=[kf0])
     o = o[m.pts.state[m.obs.pt[o]] == MAPPED]
@@ -628,6 +630,9 @@ class SLAM:
         m.remove_obs(m.obs_of(kfs=[k]))
         m.kfs.alive[k] = False
         m.images.release(m.kfs.slot[k])
+        i = np.flatnonzero(self.traj.ref == k)
+        self.traj.T[i] = self.traj.T[i] @ m.kfs.T[k] @ inv_pose(m.kfs.T[kf0])
+        self.traj.ref[i] = kf0
     if kf0 in self.pre_kfs:
       m.kfs.parent[kf0] = m.kfs.parent[self.pre_kfs[0]]
     m.kfs.parent[kf1] = kf0
@@ -996,30 +1001,32 @@ class SLAM:
   def merge_global_ba(self, force=True):
     '''
     merge a background global BA (ORB-SLAM style): keyframes and points in the snapshot get the optimized values;
-    keyframes created since move with their nearest ancestor in the snapshot, points with their reference keyframe
+    keyframes created since move with their nearest ancestor in the snapshot, points with their reference keyframe.
+    Returns whether something was merged
     '''
     p = self.pending_ba
     if p is None or (not force and self.frame < p['frame']):
-      return
+      return False
     with self.timed('global_ba_wait'):
       p['thread'].join()
     self.pending_ba = None
     m = self.map
     T_ba, X_ba, e2 = p['result']['out']
     T_now = m.kfs.T.copy()
-    # correction of every keyframe: T_new = C @ T_now, for snapshot keyframes directly, else through its ancestors
-    C = np.tile(np.eye(4), (len(m.kfs), 1, 1))
+    # correction of every keyframe in the world frame, T_new = T_now @ D (keeps the pose relative to the keyframe it
+    # follows): for snapshot keyframes directly, else through its ancestors
+    D = np.tile(np.eye(4), (len(m.kfs), 1, 1))
     in_ba = np.zeros(len(m.kfs), bool)
     in_ba[p['kfs']] = True
-    C[p['kfs']] = T_ba @ inv_pose(T_now[p['kfs']])
+    D[p['kfs']] = inv_pose(T_now[p['kfs']]) @ T_ba
     for k in range(p['kfs'].max() + 1, len(m.kfs)):     # newer keyframes: their parent was already corrected
       parent = m.kfs.parent[k]
       while parent >= 0 and not in_ba[parent] and parent > p['kfs'].max() and not m.kfs.alive[parent]:
         parent = m.kfs.parent[parent]
       if parent >= 0:
-        C[k] = C[parent]
+        D[k] = D[parent]
     alive = m.kfs.alive.copy()
-    m.kfs.T[alive] = C[alive] @ T_now[alive]
+    m.kfs.T[alive] = T_now[alive] @ D[alive]
     # points: optimized ones get their new position, the others move with their reference keyframe
     mapped = m.pts.state == MAPPED
     moved = np.flatnonzero(mapped)
@@ -1033,9 +1040,10 @@ class SLAM:
     key = m.obs.pt * len(m.kfs) + m.obs.kf
     bad_key = p['obs'][1][bad] * len(m.kfs) + p['obs'][0][bad]
     m.remove_obs(np.flatnonzero(np.isin(key, bad_key) & m.obs.alive))
-    self.T_cw = C[self.last_kf] @ self.T_cw
-    self.T_good = C[self.last_kf] @ self.T_good
+    self.T_cw = self.T_cw @ D[self.last_kf]
+    self.T_good = self.T_good @ D[self.last_kf]
     self.keep_tracks(m.pts.state[self.tr_pt] != DEAD)
+    return True
 
   def ba_problem(self, kfs, fixed, pts, o, iters):
     '''
@@ -1283,7 +1291,11 @@ class SLAM:
 
   def close_loop(self, kf, T_loop, pts, uv, disagreement):
     c, m = self.c, self.map
-    self.merge_global_ba()
+    if self.merge_global_ba():      # (the points moved: T_loop is stale)
+      T_loop, inl = self.pnp(uv, m.pts.X[pts], T_loop)
+      if inl.sum() < c.loop_min_inliers:
+        return
+      pts, uv = pts[inl], uv[inl]
     # 1. scale drift: depth of the old points (loop pose) vs nearby current points (current pose)
     cur = m.points_of(kf)
     o = m.obs_of(kfs=[kf], pts=cur)
@@ -1330,6 +1342,8 @@ class SLAM:
     m.pts.X[p] = np.einsum('nij,nj->ni', M[:, :3, :3], m.pts.X[p]) + M[:, :3, 3]
     moved = np.linalg.norm(camera_center(sim3_to_se3(S_new[row[kf]])) - camera_center(m.kfs.T[kf]))
     m.kfs.T[alive] = np.array([sim3_to_se3(Sn) for Sn in S_new])
+    i = np.flatnonzero(row[self.traj.ref] >= 0)
+    self.traj.T[i, :3, 3] /= np.array([sim3_scale(Sn) for Sn in S_new])[row[self.traj.ref[i]], None]
     self.T_cw = m.kfs.T[kf].copy()
     if m.kfs.segment[src] != m.kfs.segment[kf]:     # the new segment joins the old one
       m.kfs.segment[m.kfs.segment == m.kfs.segment[kf]] = m.kfs.segment[src]
