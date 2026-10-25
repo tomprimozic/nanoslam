@@ -51,6 +51,7 @@ class Config:
   init_check_parallax = 0.5         # deg, median parallax before a window init is attempted
   init_ratio = 2.0                  # translation established: likelihood ratio full vs rotation-only > this x extra params
   rotation_only_poses = True        # before translation is established: emit rotation-only poses (position held)
+  window_poses = True               # translation established but too little parallax for the map yet: emit the window BA's pose
   init_min_points = 50
   init_min_ratio = 0.5              # fraction of inliers with parallax (rejects rotation-dominated motion)
 
@@ -154,6 +155,7 @@ class SLAM:
     self.window = []                  # while initializing: (frame, point ids, pixels) of every frame since the anchor
     self.pre_kfs = []                 # keyframes made before translation was established (rotation-only poses)
     self.anchor = -1                  # the one the translation test is relative to
+    self.window_pose = None           # T_cw of the current frame from the window BA (translation established)
     self.init_n_tracks = 0            # tracks right after the last of them
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
@@ -446,13 +448,15 @@ class SLAM:
     good = ~bad & (X[:, 2] > 0)
     good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
     self.diag['init_ratio'] = dF / extra
-    if (dF < c.init_ratio * extra or good_angle.sum() < c.init_min_points
-        or good_angle.sum() < c.init_min_ratio * good.sum()):
-      return
-    s = self.good_depth / np.median(X[good_angle, 2])
+    s = self.good_depth / np.median(X[good, 2])
     T[:, :3, 3] *= s
     X = X * s
     T0 = m.kfs.T[kf0]
+    if dF >= c.init_ratio * extra and c.window_poses:
+      self.window_pose = T[-1] @ T0     # translation is established (the map still waits for parallax)
+    if (dF < c.init_ratio * extra or good_angle.sum() < c.init_min_points
+        or good_angle.sum() < c.init_min_ratio * good.sum()):
+      return
     self.T_cw = self.T_good = T[-1] @ T0
     self.velocity = np.eye(4)
     keep = np.zeros(len(m.pts), bool)
@@ -591,9 +595,10 @@ class SLAM:
 
   def rotation_only_pose(self):
     '''the current pose if the camera only rotated since the last keyframe (None: too few tracks)'''
-    if len(self.tr_pt) < 8:
+    has = np.isfinite(self.tr_kf_uv).all(axis=1)     # (tracks found again by relocalization have no pixel there)
+    if has.sum() < 8:
       return None
-    R, _ = self.rotation_only(self.tr_kf_uv, self.tr_uv.astype(np.float64))
+    R, _ = self.rotation_only(self.tr_kf_uv[has], self.tr_uv[has].astype(np.float64))
     return make_pose(R, np.zeros(3)) @ self.map.kfs.T[self.last_kf]
 
   def start_segment(self, new=True):
@@ -1261,10 +1266,14 @@ class SLAM:
             self.lost, self.T_good = 0, self.T_cw.copy()
           else:
             self.lost += self.initialized
+            self.window_pose = None
             self.try_initialize()
             if self.initializing and not self.initialized:
-              # no translation yet: the best pose is the rotation-only one (position held)
-              if (T := self.rotation_only_pose()) is not None:
+              # not initialized yet: the window BA's pose once translation is established, before that the
+              # rotation-only one (position held)
+              if self.window_pose is not None:
+                self.T_cw = self.window_pose
+              elif (T := self.rotation_only_pose()) is not None:
                 self.T_cw = T
               if c.rotation_only_poses:
                 self.traj.add(1, frame=index, ref=self.last_kf, T=self.T_cw @ inv_pose(self.map.kfs.T[self.last_kf]),
