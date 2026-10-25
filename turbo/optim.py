@@ -424,6 +424,7 @@ def _triangulate(R, t, cam, xn, ptr, order, iterations):
   n = len(ptr) - 1
   X = np.zeros((n, 3))
   max_angle = np.zeros(n)
+  ray_angle = np.zeros(n)   # between the observation rays: the parallax, whatever the solution
   max_err = np.zeros(n)     # in normalized image coordinates
   min_depth = np.zeros(n)
   for p in range(n):
@@ -431,6 +432,7 @@ def _triangulate(R, t, cam, xn, ptr, order, iterations):
     A = np.zeros((3, 3))
     b = np.zeros(3)
     centers = np.zeros((m, 3))
+    dirs = np.zeros((m, 3))
     for a in range(m):
       o = order[ptr[p] + a]
       k = cam[o]
@@ -441,6 +443,10 @@ def _triangulate(R, t, cam, xn, ptr, order, iterations):
       A += P
       b += P @ C
       centers[a] = C
+      dirs[a] = d
+      for bb in range(a):
+        cos = dirs[a, 0] * dirs[bb, 0] + dirs[a, 1] * dirs[bb, 1] + dirs[a, 2] * dirs[bb, 2]
+        ray_angle[p] = max(ray_angle[p], np.arccos(min(max(cos, -1.0), 1.0)))
     if abs(np.linalg.det(A)) < 1e-12:
       X[p] = np.nan
       continue
@@ -480,21 +486,22 @@ def _triangulate(R, t, cam, xn, ptr, order, iterations):
         rb = x - centers[bb]
         cos = np.sum(ra * rb) / np.sqrt(np.sum(ra * ra) * np.sum(rb * rb) + 1e-300)
         max_angle[p] = max(max_angle[p], np.arccos(min(max(cos, -1.0), 1.0)))
-  return X, max_angle, max_err, min_depth
+  return X, max_angle, max_err, min_depth, ray_angle
 
 
 def triangulate(K, T_cw, cam, pt, uv, n_points, iterations=3):
   '''
   multi-view triangulation of n_points points from their observations (cam / pt indices, pixels uv)
-  returns X, the largest ray angle (rad), the largest reprojection error (px) and the smallest depth per point
+  returns X, the largest angle at the point between its observation rays (rad), the largest reprojection error (px),
+  the smallest depth, and the largest angle between the rays' directions (rad: the parallax, whatever the solution)
   '''
   pt = pt.astype(np.int64)
   order = np.argsort(pt, kind='stable')
   ptr = np.searchsorted(pt[order], np.arange(n_points + 1))
   xn = geometry.unproject(K, uv)[:, :2]
-  X, angle, err, depth = _triangulate(T_cw[:, :3, :3].copy(), T_cw[:, :3, 3].copy(), cam.astype(np.int64), xn, ptr,
-                                      order, iterations)
-  return X, angle, err * np.sqrt(K[0, 0] * K[1, 1]), depth
+  X, angle, err, depth, rays = _triangulate(T_cw[:, :3, :3].copy(), T_cw[:, :3, 3].copy(), cam.astype(np.int64), xn,
+                                            ptr, order, iterations)
+  return X, angle, err * np.sqrt(K[0, 0] * K[1, 1]), depth, rays
 
 
 @njit(cache=True, nogil=True)
