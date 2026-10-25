@@ -306,7 +306,7 @@ def main():
     results = run_all(names, args.set, args.out, args.jobs, starts, args.max_frames)
     for r in results:
       print(format_result(r) if 'error' not in r else f"{r['name']:32s} ERROR {r['error']}")
-    return summary([args.out])
+    return summary([str(args.out)])
   faulthandler.enable()
   rr = setup_rerun(args.dataset, args.rerun_save) if args.rerun or args.rerun_save else None
   r = run(args.dataset, make_config(args.set), args.out, args.start, args.max_frames, rr)

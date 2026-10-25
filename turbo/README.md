@@ -50,18 +50,23 @@ than 50 map points are tracked: *relocalization by projection* (local map, wide 
 rotation + motion blur, e.g. V2_03): several pose hypotheses, DSO-style: the last good pose rotated by +-15 / 30 deg,
 then, round-robin, all keyframe poses (nearest first), each searched with its own points.
 
-**Initialization** (`try_initialize_window`; the design follows `../../slamfold/DESIGN.md`). Corners detected in the
-first frame are tracked; every frame (once their median parallax is >= 0.5 deg) a batch BA runs over the frames since
-then, up to 20 of them chosen evenly in parallax (a long still start collapses to a few): rotations start from the
-*rotation-only* solution of each frame (robust Wahba on the bearings), translations from the 5-point direction scaled
-by the frame's parallax, points from two-view triangulation; gauge = first frame fixed + scale along the baseline.
-Translation counts as established when the likelihood ratio of the full model against the rotation-only one exceeds
-2x its extra parameters and >= 50 points (and >= half of the inliers) have >= 1 deg of parallax; the window's points
-seed the map, the last frame becomes the second keyframe, and the earlier frames get their poses with hindsight.
-Compared with the two-view initialization (5-point + 2.5 deg median parallax) it initializes earlier where the start
-is slow (household frame 14 vs 61, MH_05 42 vs 80) with the same early accuracy (first 150 frames: position 1.00x,
-rotation 0.86x); downstream it is neutral (final 0.98 [0.88, 1.07]). `rotation_only_poses=True` also emits the
-rotation-only pose (t = 0) for every frame before that.
+**Initialization** (`try_initialize_window`; the design follows `../../slamfold/DESIGN.md`). Until translation is
+established the system tracks like a rotation-only one: every frame gets the *rotation-only* pose (robust Wahba on
+the bearings of the tracks w.r.t. the last keyframe, position held), and when fewer than 70% of the tracks survive a
+keyframe is made at that pose with new corners (`pre_keyframe`), so orientation carries through e.g. turning 90 deg
+and then moving. The translation test is relative to an *anchor* keyframe - the first one, until fewer than 50 of its
+points are tracked, then the newest one: every frame (once the median parallax is >= 0.5 deg) a batch BA runs over the
+frames since the anchor, up to 20 of them chosen evenly in parallax (a long still start collapses to a few): rotations
+start from the rotation-only solution of each frame, translations from the 5-point direction scaled by the frame's
+parallax, points from two-view triangulation; gauge = anchor fixed + scale along the baseline. Translation counts as
+established when the likelihood ratio of the full model against the rotation-only one exceeds 2x its extra
+parameters and >= 50 points (and >= half of the inliers) have >= 1 deg of parallax; the window's points seed the map,
+the last frame becomes the second keyframe, the other pre-translation keyframes leave the map (their positions were
+only assumed) and the window's frames get their poses with hindsight. Compared with the two-view initialization
+(5-point + 2.5 deg median parallax) it initializes earlier where the start is slow (household frame 14 vs 61, MH_05
+42 vs 80) with the same early accuracy (first 150 frames: position 1.00x, rotation 0.86x); downstream it is neutral
+(final 0.98 [0.88, 1.07]). The live rotation before that is ~1 deg off at the switch (median over the runs): the
+translation that is not detected yet shows up as rotation, most just before it is.
 
 **Patch alignment** (`lk.py`). The template comes from a keyframe that observed the point: sampled around that
 observation, warped with the local affine approximation of the homography of the plane through the point
@@ -133,29 +138,30 @@ so with 5 starts x 17 sequences effects below ~15% are not resolvable.
 seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
 [m], *rot* = rotation drift [deg], *ATE* = whole-trajectory alignment [m]. *full* = the default system, *VO* =
 `loop=False final_ba_iters=0` (no loop closing). One config for all 17 sequences; only the camera calibration comes
-from the dataset. (`runs/f_final_seed*`, `runs/f_final_vo_seed*`). *lost* = tracking losses after initialization
-(mean over the runs; frames before initialization are not counted).
+from the dataset. (`runs/i_pre_seed*`, `runs/i_pre_vo_seed*`). *lost* = tracking losses (mean over the runs). Poses
+are emitted from the first frame; the initial section for the alignment starts where the estimate first moves (before
+translation is established positions are held, see Initialization).
 
 | sequence | final (full) | rot (full) | ATE (full) | final (VO) | rot (VO) | ATE (VO) | lost: episodes / frames |
 |---|---|---|---|---|---|---|---|
-| fr2/desk | 0.008 | 1.16 | 0.011 | 0.025 | 1.35 | 0.013 | 0.0 / 0.0% |
-| fr3/long_office_household | 0.012 | 0.75 | 0.031 | 0.139 | 2.23 | 0.045 | 0.0 / 0.0% |
-| MH_01_easy | 0.031 | 3.55 | 0.022 | 0.219 | 3.73 | 0.084 | 0.0 / 0.0% |
-| MH_02_easy | 0.039 | 1.16 | 0.036 | 0.131 | 1.30 | 0.044 | 0.0 / 0.0% |
-| MH_03_medium | 0.022 | 1.84 | 0.049 | 0.161 | 0.98 | 0.148 | 0.0 / 0.0% |
-| MH_04_difficult | 0.079 | 0.30 | 0.077 | 0.173 | 0.59 | 0.120 | 0.0 / 0.0% |
+| fr2/desk | 0.009 | 1.20 | 0.012 | 0.019 | 1.20 | 0.013 | 0.0 / 0.0% |
+| fr3/long_office_household | 0.013 | 0.78 | 0.031 | 0.152 | 2.09 | 0.048 | 0.0 / 0.0% |
+| MH_01_easy | 0.042 | 3.55 | 0.025 | 0.205 | 3.77 | 0.080 | 0.0 / 0.0% |
+| MH_02_easy | 0.040 | 1.14 | 0.037 | 0.165 | 1.31 | 0.056 | 0.0 / 0.0% |
+| MH_03_medium | 0.023 | 1.85 | 0.049 | 0.181 | 0.81 | 0.163 | 0.0 / 0.0% |
+| MH_04_difficult | 0.056 | 0.31 | 0.081 | 0.234 | 0.55 | 0.128 | 0.0 / 0.0% |
 | MH_05_difficult | 0.064 | 1.09 | 0.059 | 0.235 | 0.78 | 0.128 | 0.0 / 0.0% |
 | V1_01_easy | 0.072 | 3.30 | 0.035 | 0.101 | 3.55 | 0.057 | 0.0 / 0.0% |
-| V1_02_medium | 0.015 | 0.41 | 0.016 | 0.200 | 3.81 | 0.145 | 0.0 / 0.0% |
-| V1_03_difficult | 0.065 | 0.73 | 0.048 | 0.203 | 6.76 | 0.085 | 0.0 / 0.0% |
-| V2_01_easy | 0.013 | 0.36 | 0.035 | 0.242 | 1.15 | 0.065 | 0.0 / 0.0% |
-| V2_02_medium | 0.059 | 2.03 | 0.029 | 0.301 | 3.70 | 0.089 | 0.0 / 0.0% |
-| V2_03_difficult | 0.197 | 2.04 | 0.640 | 0.427 | 3.90 | 0.629 | 1.9 / 9.3% |
+| V1_02_medium | 0.015 | 0.41 | 0.016 | 0.200 | 3.81 | 0.144 | 0.0 / 0.0% |
+| V1_03_difficult | 0.091 | 1.27 | 0.046 | 0.195 | 6.75 | 0.087 | 0.0 / 0.0% |
+| V2_01_easy | 0.014 | 0.37 | 0.037 | 0.241 | 1.15 | 0.066 | 0.0 / 0.0% |
+| V2_02_medium | 0.059 | 2.02 | 0.032 | 0.275 | 3.85 | 0.088 | 0.0 / 0.0% |
+| V2_03_difficult | 0.178 | 1.93 | 0.589 | 0.272 | 1.57 | 0.580 | 2.0 / 8.0% |
 | abandonedfactory P001 | 0.383 | 2.61 | 0.077 | 0.383 | 2.61 | 0.077 | 1.0 / 0.9% |
-| carwelding P007 | 0.293 | 0.52 | 0.129 | 0.548 | 0.66 | 0.150 | 0.0 / 0.0% |
-| seasidetown P003 | 9.207 | 101.42 | 3.105 | 9.207 | 101.42 | 3.105 | 1.0 / 57.1% |
-| seasonsforest P002 | 0.489 | 0.27 | 0.082 | 0.489 | 0.27 | 0.082 | 0.0 / 0.0% |
-| **geometric mean** | **0.075** | **1.32** | **0.062** | **0.254** | **2.15** | **0.108** | |
+| carwelding P007 | 0.297 | 0.54 | 0.133 | 0.564 | 0.69 | 0.154 | 0.0 / 0.0% |
+| seasidetown P003 | 10.082 | 100.99 | 3.094 | 10.082 | 100.99 | 3.094 | 1.0 / 55.4% |
+| seasonsforest P002 | 0.502 | 0.27 | 0.080 | 0.502 | 0.27 | 0.080 | 0.0 / 0.0% |
+| **geometric mean** | **0.078** | **1.38** | **0.063** | **0.253** | **2.00** | **0.110** | |
 
 - With hindsight (`--trajectory final`: keyframe poses after all loop closures and the final BA) the full system's
   ATE is ~2x lower (geometric mean ~3.8 cm in the first round); live is what a robot would have had.
@@ -170,7 +176,7 @@ from the dataset. (`runs/f_final_seed*`, `runs/f_final_vo_seed*`). *lost* = trac
   1.6-2.9 cm, MH_04 8.5-13.8 cm, V2_03 36-52 cm or a failure ([1](https://arxiv.org/pdf/2405.03413),
   [2](https://arxiv.org/pdf/2012.11863), [3](https://arxiv.org/pdf/2405.13748)).
 - The human-written `nanoslam.py` on household, same evaluation (live, 20%), starts 0 / 7 / 14: final 0.084 /
-  0.367 / 0.560, ATE 0.044 / 0.134 / 0.173 (turbo: final 0.013 full, 0.154 VO).
+  0.367 / 0.560, ATE 0.044 / 0.134 / 0.173 (turbo: final 0.013 full, 0.152 VO).
 - `drift` (all frames, initial-section alignment) is dominated by the alignment lever arm: a degree of error in the
   initial section's orientation makes tens of cm at the far end; `rot` measures the rotation drift without it.
 - Speed (single process, M5 Pro, full system): household 144 fps, MH_01 120, MH_03 58, V2_02 57, V1_02 52.
@@ -237,7 +243,8 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | window BA initialization (vs two-view 5-point at 2.5 deg), VO, 2 seeds | final 0.98 [0.88, 1.07], rotation 1.08 [1.01, 1.20] (V2_03); first 150 frames after init: position 1.00x, rotation 0.86x, initialized earlier on slow starts | adopted |
 | window init with an attempt gate of 1.5 / 2.5 deg instead of 0.5, VO, 1 seed, 8 sequences | 1.16 / 1.01 vs two-view (noise) | 0.5 |
 | intermediate keyframes taken over from the init window | never triggers (init happens before 2x the keyframe parallax) | removed |
-| re-referencing the init window when the first frame's tracks die | the first keyframe is only ever given up on seasidetown (3-7 restarts in its first 20 frames) | not needed |
+| poses from the first frame: rotation-only poses + keyframes (new corners, same map) before translation is established, instead of nothing + restarting from scratch when the first keyframe's tracks die, 2 seeds | full final 1.04 [0.97, 1.11], rotation 1.04 [1.00, 1.11] (all of it V1_03 full, 0.73 -> 1.27 deg, its VO unchanged: chaos), VO final 1.00 [0.92, 1.07], rotation 0.93 [0.83, 1.00]; same init frames; live rotation error before init ~1 deg (median of the max) | adopted (positions from frame 0, orientation kept) |
+| ... with the anchor moving to the *next* pre-translation keyframe instead of the newest | MH_02 (start 5) initializes at frame 159 instead of 43: the older anchor keeps ~50 points, too few with parallax | newest |
 | V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |
 | evaluation: initial-section alignment from the hindsight poses (applied to the live ones; `evaluate(align_est=)`) | VO: no change (final 0.254 vs 0.254); full: final 0.067 vs 0.075 but start spread 3.8 vs 2.7, drift worse (pose graphs move the early keyframes, so the two are in different frames) | kept live |
 | our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
@@ -255,8 +262,8 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
 ## Next
 
 - initialization beyond the window BA: the depth-integrated (marginal) likelihood of slamfold instead of MAP depths,
-  a trailing window that re-references when the first frame's tracks die (V1_01's rotation-heavy start), small-motion
-  (DfUSMC-style) depth for the very first frames;
+  small-motion (DfUSMC-style) depth for the very first frames; live poses from the window BA's full model before the
+  translation test passes (the ~1 deg rotation error just before initialization);
 - cheaper global BA: it is 1-4 s for 300-600 keyframes (the LM loop in Python competes for the GIL with tracking;
   move the whole LM into numba, fewer iterations, or only the loop's region) - the remaining latency spikes;
 - the chaos is mostly the random walk of the drift itself (max / min over start frames of a random walk's endpoint
