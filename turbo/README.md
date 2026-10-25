@@ -237,6 +237,8 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | window BA initialization (vs two-view 5-point at 2.5 deg), VO, 2 seeds | final 0.98 [0.88, 1.07], rotation 1.08 [1.01, 1.20] (V2_03); first 150 frames after init: position 1.00x, rotation 0.86x, initialized earlier on slow starts | adopted |
 | window init with an attempt gate of 1.5 / 2.5 deg instead of 0.5, VO, 1 seed, 8 sequences | 1.16 / 1.01 vs two-view (noise) | 0.5 |
 | intermediate keyframes taken over from the init window | never triggers (init happens before 2x the keyframe parallax) | removed |
+| re-referencing the init window when the first frame's tracks die | the first keyframe is only ever given up on seasidetown (3-7 restarts in its first 20 frames) | not needed |
+| V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |
 | our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
 
 Where the error comes from: rotation error at the end is 90-100% *systematic* (the same for all start frames) on
