@@ -81,8 +81,15 @@ def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align
   g = gt[first:][has_gt[first:]]
   n_init = np.flatnonzero(has_gt[first:])[initial_section(g, coverage) - 1] + 1
   init = idx[idx < first + n_init]
+  # the section starts where the estimate starts to move (before, positions are held: rotation-only poses before
+  # translation was established)
+  moving = idx[np.linalg.norm(est[idx] - est[first], axis=1) > 1e-9]
+  if len(moving) and moving[0] > first:
+    g2 = gt[moving[0]:][has_gt[moving[0]:]]
+    n2 = np.flatnonzero(has_gt[moving[0]:])[initial_section(g2, coverage) - 1] + 1
+    init = idx[(idx >= moving[0]) & (idx < moving[0] + n2)]
   if len(init) < 3:
-    init = idx[:3]
+    init = idx[:3] if not len(moving) else moving[:3]
   if align_est is not None:   # alignment from other estimates of the initial section (e.g. hindsight poses)
     a = hold(align_est)
     init_a = init[np.isfinite(a[init]).all(axis=1)]
