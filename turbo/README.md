@@ -218,9 +218,11 @@ translation is established positions are held, see Initialization).
   | V1_02 | 2.8 / 4.4 / 102 | 29 / 94 / 149 | 48 / 159 / 189 | 642 / 1614 / 1633 (3) |
   | V2_02 | 2.7 / 4.2 / 89 | 28 / 92 / 122 | 58 / 195 / 248 | 128 / 150 / 150 (2) |
 
-  Loop closures are synchronous for the pose graph (0.1-0.8 s: numerical Jacobians over all keyframes) and the
-  re-search; the global BA (3 iterations) runs in the background. The ~100 ms frame maxima are merges of the
-  background BA / relocalization.
+  Loop closures are synchronous for the pose graph (since the allocation-free numba linearization, the fixed
+  sparsity pattern and SuperLU in symmetric mode: 25 ms on household, 51 ms on V1_02's 316 keyframes, was 92 / 309)
+  and the re-search; the global BA (3 iterations) runs in the background. Frames before initialization run the
+  window test every frame (~20 ms median, ~100 ms p99); lost / mapless frames try up to 17 relocalization hypotheses
+  (~130 ms on desk2; `reloc_max_hypotheses=4`: ~18 ms, neutral on the benchmark). (The table predates both.)
 - Robustness to the parameters (first round, hindsight ATE, single runs, lost frames not scored): 4 random
   perturbations of *all* numeric parameters (each scaled by 0.7-1.4x): geometric mean ATE 1.9-2.4 cm vs 2.3 cm with
   the defaults (`runs/v5_perturb*`) - i.e. within the noise floor measured later.
@@ -279,6 +281,8 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | review fixes: background BA corrections propagated in the world frame (were camera-frame), loop pose re-estimated after merging a pending BA, frames between keyframes rescaled with loop corrections, frames of dropped pre-init keyframes re-expressed; summaries use the saved frame range, full, 2 seeds | live: final 1.01 [0.95, 1.08], ATE 0.99; hindsight: ATE 0.95 [0.90, 0.99], final 0.93 [0.79, 1.05]; VO unchanged | fixed |
 | translation test: depths integrated out (slamfold) instead of MAP depths, map seeded with slamfold's resolved depths, no parallax gate, 22 sequences, 2 seeds | inits at 1-5 mm of baseline (mean frame 10 vs 26), early error 0.40 -> 0.87% of the path; full final 1.46 [1.15, 1.99], VO 1.26 [1.02, 1.72] | no (seeding) |
 | ... with the map seeded by the parallax rule as before | full final 0.92 [0.83, 1.00], ATE 0.96; VO final 0.97 [0.86, 1.06], ATE 0.95 [0.84, 1.02]; pre-init rotation error 0.42 -> 0.27 deg; same init frames; ~22 ms per pre-init frame (the test: 6 ms) | adopted |
+| pose graph: allocation-free numerical Jacobians, normal equations in a fixed pattern (numba), SuperLU in symmetric mode | same solutions (1e-10), V1_02 309 -> 51 ms, household 92 -> 25 ms; benchmark neutral (full final 0.99 [0.97, 1.00]) | adopted |
+| relocalization: round-robin keyframes nearest first, cursor by the number tried; `reloc_max_hypotheses` cap per frame | cap 4 vs none: final 0.99 [0.98, 1.00], ATE 1.00 (2 sequences change); mapless frames 129 -> 18 ms on desk2 | option (no cap by default) |
 | lost = initializing with a map (anchor = last keyframe; continue / provisional part merged by Sim3 when the old map is found), instead of the rotation tracker + relocalization, 22 sequences, 2 seeds | lost frames 13.4 -> 1.2%; full final 0.99 [0.85, 1.15], ATE 0.88 [0.69, 1.01], rotation 0.95; desk2 0.74 -> 0.27 m (29 -> 4 deg), seasidetown 10.1 -> 5.4 m; 360 0.49 -> 1.45 m, rpy rotation 2.3 -> 5.1 deg; room / V2_03 about the same (merged after 100s of frames, provisional scale off by up to 10x) | adopted |
 | live pose from the window BA once the translation test passes (until the map conditions do), 22 sequences, 2 seeds | pre-init rotation error 1.06 -> 0.42 deg (median of the max per run), jump at initialization 1.00 -> 0.17 deg; downstream full final 1.04 [0.96, 1.14], rotation 0.96 [0.89, 1.04], VO final 1.03 [0.96, 1.11] | adopted |
 | V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |

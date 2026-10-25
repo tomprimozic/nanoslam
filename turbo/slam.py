@@ -64,6 +64,8 @@ class Config:
   epipolar_px = 3.0
   reloc_min_3d = 50                 # relocalize (search the map with a wide window) below this many 3D tracks
   reloc_keyframes = 8               # keyframe poses tried per frame while lost
+  reloc_max_hypotheses = 0          # cap on the pose hypotheses relocalization tries per frame (0: no cap; ~3 x faster
+                                    # lost / mapless frames at 4, at the cost of slower recovery)
   mapless = True                    # lost: track on like before the first initialization (rotation-only / window BA poses)
                                     # from the last keyframe, until a new part of the map is made or relocalization works
   resume_scale_points = 10          # map points next to the new ones that make the scale of a new part observable; with
@@ -152,6 +154,7 @@ class SLAM:
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
     self.cursor = 0                   # round-robin position of the search for the old map (provisional part)
+    self.reloc_cursor = 0             # round-robin position of the keyframe hypotheses of relocalization
     self.frame = -1
     self.pending_ba = None            # global BA running in the background (c.global_ba_delay)
     self.img = self.pyr = None
@@ -687,8 +690,12 @@ class SLAM:
           for deg in (15, -15, 30, -30):
             R = Rotation.from_rotvec(np.deg2rad(deg) * np.array(axis)).as_matrix()
             hypotheses.append((make_pose(R, np.zeros(3)) @ self.T_good, near[:c.ba_window]))
-      for k in near[(self.lost * c.reloc_keyframes + np.arange(c.reloc_keyframes)) % len(near)]:
+      cap = c.reloc_max_hypotheses or len(hypotheses) + c.reloc_keyframes
+      hypotheses = hypotheses[:cap]
+      n_kfs = min(c.reloc_keyframes, cap - len(hypotheses))
+      for k in near[(self.reloc_cursor + np.arange(n_kfs)) % len(near)]:     # round-robin, nearest first
         hypotheses.append((m.kfs.T[k], [k]))
+      self.reloc_cursor += n_kfs
     m3 = np.flatnonzero(self.mapped_tracks())
     best = (0, None, None, None, None)
     for T, kfs in hypotheses:
@@ -1286,7 +1293,7 @@ class SLAM:
         with self.timed('init'):
           if self.initialized and self.relocalize(self.T_cw):    # back on the map
             self.abort_mapless()
-            self.lost, self.T_good = 0, self.T_cw.copy()
+            self.lost, self.reloc_cursor, self.T_good = 0, 0, self.T_cw.copy()
           else:
             self.lost += self.initialized
             self.window_pose = None
@@ -1311,6 +1318,7 @@ class SLAM:
           velocity = orthonormalize(self.T_cw @ inv_pose(T_prev)) if not self.lost else np.eye(4)
           self.velocity = velocity
           self.lost = 0
+          self.reloc_cursor = 0
           self.T_good = self.T_cw.copy()
           m3 = self.mapped_tracks()
           self.good_depth = float(np.median(transform(self.T_cw, self.map.pts.X[self.tr_pt[m3]])[:, 2]))
