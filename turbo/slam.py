@@ -34,7 +34,6 @@ class Config:
   klt_levels = 3
   klt_iters = 30
   klt_fb = 0.5                      # px, forward-backward check
-  motion_model = 'constant'         # pose prediction: 'none', 'constant' (velocity), 'accel' (constant acceleration)
   phase_prior = True                # global image shift by phase correlation corrects the KLT initial guesses
   phase_min_response = 0.05         # phase correlation peak needed to trust the shift
   phase_min_correction = 2.0        # px, only correct the prediction by larger differences
@@ -45,8 +44,7 @@ class Config:
   detect_blur = True                # 3x3 blur before the corner score (OV2SLAM)
 
   # initialization
-  init_mode = 'window'              # 'window': batch BA over the frames since the anchor keyframe; 'twoview'
-  init_parallax = 2.5               # deg, median (not rotation compensated), twoview
+  # (batch BA over the frames since the anchor keyframe, see try_initialize)
   init_window = 20                  # frames in the window BA (subsampled)
   init_check_parallax = 0.5         # deg, median parallax before a window init is attempted
   init_ratio = 2.0                  # translation established: likelihood ratio full vs rotation-only > this x extra params
@@ -57,23 +55,14 @@ class Config:
 
   # tracking
   pnp_px = 3.0
-  # adaptive thresholds: the live noise level = robust scale of the PnP residuals / noise_ref
-  adaptive_pnp = False              # PnP inliers re-decided at the live noise level
-  adaptive_map = False              # keyframes keep their noise level: BA weights, triangulation / epipolar thresholds
-  noise_ref = 0.67                  # px
   pnp_min_inliers = 15
-  drop_pnp_outliers = True          # False: keep tracking them (they are excluded from this frame's pose only)
   epipolar_px = 3.0
-  track_local_map = False           # every frame: re-find untracked points of the local keyframes (neutral, slower)
-  local_map_radius = 3.0            # px
   reloc_min_3d = 50                 # relocalize (search the map with a wide window) below this many 3D tracks
   reloc_keyframes = 8               # keyframe poses tried per frame while lost
   mapless = True                    # lost: track on like before the first initialization (rotation-only / window BA poses)
                                     # from the last keyframe, until a new part of the map is made or relocalization works
   resume_scale_points = 10          # map points next to the new ones that make the scale of a new part observable; with
                                     # fewer it is provisional (scale guessed) until the old map is found again
-  reinit = False                    # start a new map segment when relocalization keeps failing
-  reinit_after = 10                 # frames lost before that
 
   # triangulation
   tri_min_angle = 1.0               # deg
@@ -88,7 +77,6 @@ class Config:
   ba_window = 10
   ba_min_covisible = 15
   ba_iters = 10
-  ba_loss = 'huber'                 # or 'cauchy'
 
   # patch search (search by projection, re-measurement)
   patch_half = 4                    # 9x9
@@ -99,7 +87,6 @@ class Config:
   search_min_ncc = 0.75
   remeasure = True                  # re-measure tracked points from their reference keyframe
   remeasure_radius = 2.0
-  remeasure_drop_slipped = False    # drop tracks whose re-measurement is further than remeasure_radius
   remeasure_min_ncc = 0.8
   fuse_px = 2.0                     # merge points re-found within this distance of another track
 
@@ -124,9 +111,6 @@ class Config:
   cull_keyframes = True
   cull_kf_shared = 0.8              # near-duplicate keyframes: fraction of shared points,
   cull_kf_angle = 10.0              # deg, and orientation difference (and closer than the keyframe parallax)
-  cull_old_redundant = False        # also drop old keyframes whose points are (mostly) seen by >= 3 others
-  cull_old_age = 20                 # keyframes
-  cull_old_redundancy = 0.9
   ransac_seed = 0
 
 
@@ -148,13 +132,10 @@ class SLAM:
     self.initialized = False
     self.T_cw = np.eye(4)
     self.T_good = np.eye(4)           # last successfully tracked pose
-    self.noise = 1.0                  # live noise level: residual scale / noise_ref
     self.velocity = np.eye(4)
-    self.acceleration = np.eye(4)
     self.counts = collections.Counter()   # diagnostics
     self.last_kf = -1
-    self.segment = 0                  # map segment (a new one starts when tracking is lost and we re-initialize)
-    self.initializing = True          # waiting for two-view initialization (of the first map or a new segment)
+    self.initializing = True          # no map tracking: before the first initialization, or lost (see start_mapless)
     self.good_depth = 1.0             # median depth of the tracked points at the last good frame
     self.window = []                  # while initializing: (frame, point ids, pixels) of every frame since the anchor
     self.pre_kfs = []                 # keyframes made before translation was established (rotation-only poses)
@@ -165,7 +146,7 @@ class SLAM:
     self.init_n_tracks = 0            # tracks right after the last of them
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
-    self.segment_cursor = 0           # round-robin position of the loop search across segments
+    self.cursor = 0                   # round-robin position of the search for the old map (provisional part)
     self.frame = -1
     self.pending_ba = None            # global BA running in the background (c.global_ba_delay)
     self.img = self.pyr = None
@@ -309,7 +290,7 @@ class SLAM:
 
   def add_keyframe(self, T_cw):
     m = self.map
-    kf = m.kfs.add(1, T=T_cw, frame=self.frame, parent=self.last_kf, segment=self.segment, noise=self.noise)[0]
+    kf = m.kfs.add(1, T=T_cw, frame=self.frame, parent=self.last_kf)[0]
     if m.images is None:
       m.images = lk.ImageStore(self.pyr)
     m.kfs.slot[kf] = m.images.add(self.pyr)
@@ -341,10 +322,6 @@ class SLAM:
 
   # ------------------------------------------------------------------------------------------------- initialization
 
-  def try_initialize(self):
-    if self.c.init_mode == 'window':
-      return self.try_initialize_window()
-    return self.try_initialize_twoview()
 
   def rotation_only(self, uv_ref, uv, iterations=3):
     '''
@@ -364,7 +341,7 @@ class SLAM:
       w = np.where(res <= optim.HUBER, 1.0, optim.HUBER / np.maximum(res, 1e-9))
     return R, res
 
-  def try_initialize_window(self):
+  def try_initialize(self):
     '''
     batch BA over the frames since the anchor keyframe (subsampled), started from the rotation-only rotations and the
     two-view translation direction; initialized once the rotation-only model clearly explains the tracks worse than the
@@ -514,54 +491,7 @@ class SLAM:
     self.detect(kf1)
     self.kf_n3d = int(self.mapped_tracks().sum())
     self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
-    self.events.append({'type': 'init' if not resumed else 'resume', 'frame': self.frame, 'segment': self.segment,
-                        'points': int(len(good_pts)), 'frames': len(frames), 'ratio': dF / extra, 'scale_from': n_scale})
-
-  def try_initialize_twoview(self):
-    '''
-    two-view initialization from the tracks of the anchor keyframe (see init_anchor; the first keyframe of a new segment
-    is at the last good pose): relative pose, triangulation, scale = median depth 1 (first map) / the depth
-    seen before tracking was lost (new segment)
-    '''
-    c, m = self.c, self.map
-    kf0, sub, ref = self.init_anchor()
-    if sub.sum() < c.init_min_points:
-      return
-    tr_pt = self.tr_pt[sub]
-    cur = self.tr_uv[sub].astype(np.float64)
-    if np.median(np.linalg.norm(cur - ref, axis=1)) < self.px(c.init_parallax):
-      return
-    pose, info = poselib.estimate_relative_pose(ref, cur, self.camera, self.camera,
-                                                {'max_epipolar_error': 1.0, 'success_prob': 0.9999,
-                                                 'seed': c.ransac_seed}, {})
-    inliers = np.array(info['inliers'], bool)
-    T_10 = make_pose(pose.R, pose.t)
-    n = len(ref)
-    X, angle, err, depth = optim.triangulate(self.K, np.array([np.eye(4), T_10]), np.r_[np.zeros(n, int), np.ones(n, int)],
-                                             np.r_[np.arange(n), np.arange(n)], np.r_[ref, cur], n)
-    good = inliers & (depth > 0) & (err <= c.tri_max_px)
-    good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
-    if good_angle.sum() < c.init_min_points or good_angle.sum() < c.init_min_ratio * inliers.sum():
-      return
-    s = self.good_depth / np.median(X[good_angle, 2])
-    T_10[:3, 3] *= s
-    T0 = m.kfs.T[kf0]
-    self.T_cw = self.T_good = T_10 @ T0
-    self.velocity = np.eye(4)
-    keep = np.zeros(len(self.tr_pt), bool)
-    keep[np.flatnonzero(sub)[inliers]] = True
-    self.keep_tracks(keep)
-    m.kill(np.setdiff1d(m.points_of(kf0, CANDIDATE), self.tr_pt))
-    kf1 = self.add_keyframe(self.T_cw)
-    good_pts = tr_pt[good_angle]
-    m.pts.X[good_pts] = transform(inv_pose(T0), X[good_angle] * s)
-    m.pts.state[good_pts] = MAPPED
-    self.drop_pre_keyframes(kf0, kf1)
-    self.initialized, self.initializing, self.lost = True, False, 0
-    self.local_ba(kf1)
-    self.detect(kf1)
-    self.kf_n3d = int(self.mapped_tracks().sum())
-    self.events.append({'type': 'init', 'frame': self.frame, 'segment': self.segment, 'points': int(len(good_pts))})
+    self.events.append({'type': 'init' if not resumed else 'resume', 'frame': self.frame, 'points': int(len(good_pts)), 'frames': len(frames), 'ratio': dF / extra, 'scale_from': n_scale})
 
   def reset(self):
     self.map = Map()
@@ -646,27 +576,14 @@ class SLAM:
     R, _ = self.rotation_only(self.tr_kf_uv[has], self.tr_uv[has].astype(np.float64))
     return make_pose(R, np.zeros(3)) @ self.map.kfs.T[self.last_kf]
 
-  def start_segment(self, new=True):
-    '''tracking is lost for good: start a new map segment at the last good pose (joined to the map by a loop later)'''
-    self.keep_tracks(np.zeros(len(self.tr_pt), bool))
-    if new:
-      self.segment = int(self.map.kfs.segment.max()) + 1
-      self.events.append({'type': 'segment', 'frame': self.frame, 'segment': self.segment})
-    self.initializing = True
-    kf = self.add_keyframe(self.T_good)
-    self.detect(kf)
-    self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
-    self.pre_kfs, self.anchor, self.init_n_tracks = [kf], kf, len(self.tr_pt)
-
-  def abort_segment(self):
-    '''relocalized on the map while initializing a new segment: drop it'''
+  def abort_mapless(self):
+    '''relocalized on the map while lost: the keyframes made since leave it'''
     m = self.map
     for k in self.pre_kfs[::-1]:
       self.last_kf = int(m.kfs.parent[k])
       self.remove_keyframe(k)
     self.pre_kfs = []
     self.keep_tracks(m.pts.state[self.tr_pt] != DEAD)
-    self.segment = int(m.kfs.segment[self.last_kf])
     self.initializing = False
 
   # ------------------------------------------------------------------------------------------------- tracking
@@ -679,14 +596,10 @@ class SLAM:
       initial = poselib.CameraPose()
       initial.R, initial.t = T_guess[:3, :3], T_guess[:3, 3]
     pose, info = poselib.estimate_absolute_pose(np.asarray(uv, np.float64), X, self.camera,
-                                                {'max_reproj_error': threshold or self.px_threshold(c.pnp_px, c.adaptive_pnp),
+                                                {'max_reproj_error': threshold or c.pnp_px,
                                                  'seed': c.ransac_seed, 'min_iterations': 50},
                                                 {'loss_type': 'HUBER', 'loss_scale': 1.0}, initial)
     return make_pose(pose.R, pose.t), np.array(info['inliers'], bool)
-
-  def px_threshold(self, px, adaptive):
-    '''a pixel threshold, at the current noise level if adaptive'''
-    return px * self.noise if adaptive else px
 
   def estimate_pose(self, T_pred):
     c = self.c
@@ -694,25 +607,18 @@ class SLAM:
     if len(m3) < c.pnp_min_inliers:
       return False
     X, uv = self.map.pts.X[self.tr_pt[m3]], self.tr_uv[m3]
-    T, inliers = self.pnp(uv, X, T_pred, threshold=c.pnp_px * max(self.noise, 1) if c.adaptive_pnp else None)
+    T, inliers = self.pnp(uv, X, T_pred)
     if inliers.sum() < c.pnp_min_inliers:
       return False
     # robust scale of the reprojection residuals of all tracked map points (MAD per axis)
     proj, _ = project(self.K, T, X)
     sigma = float(1.4826 * np.median(np.abs(proj - uv)))
     self.diag['sigma'] = sigma
-    self.noise = float(np.clip(sigma / c.noise_ref, 0.5, 3.0))
-    if c.adaptive_pnp:   # re-decide the inliers at the measured noise level and refine
-      inliers = np.linalg.norm(proj - uv, axis=1) <= self.px_threshold(c.pnp_px, True)
-      if inliers.sum() < c.pnp_min_inliers:
-        return False
-      T, _ = optim.refine_pose(self.K, T, X[inliers], uv[inliers], delta=optim.HUBER * self.noise)
     self.T_cw = T
     self.diag['inliers'] = int(inliers.sum())
-    if c.drop_pnp_outliers:
-      keep = np.ones(len(self.tr_pt), bool)
-      keep[m3[~inliers]] = False
-      self.keep_tracks(keep)
+    keep = np.ones(len(self.tr_pt), bool)
+    keep[m3[~inliers]] = False
+    self.keep_tracks(keep)
     return True
 
   def relocalize(self, T_guess):
@@ -761,28 +667,8 @@ class SLAM:
                         'n3d': int(self.mapped_tracks().sum())})
     return True
 
-  def track_local_map(self):
-    '''re-find untracked points of the local keyframes in the current frame (longer tracks), then refine the pose'''
-    c, m = self.c, self.map
-    local = self.local_keyframes(self.last_kf, c.ba_window)
-    candidates = np.setdiff1d(np.unique(m.obs.pt[m.obs_of(kfs=local)]), self.tr_pt)
-    pt, uv = self.search(self.T_cw, self.pyr, candidates, 0, 0, c.local_map_radius)
-    self.add_tracks(pt, uv, np.full((len(pt), 2), np.nan))
-    m3 = np.flatnonzero(self.mapped_tracks())
-    T, e2 = optim.refine_pose(self.K, self.T_cw, m.pts.X[self.tr_pt[m3]], self.tr_uv[m3])
-    keep = np.ones(len(self.tr_pt), bool)
-    keep[m3[~(e2 <= optim.CHI2_2D)]] = False
-    if keep[m3].sum() >= c.pnp_min_inliers:
-      self.T_cw = T
-      self.keep_tracks(keep)
-
   def predict(self, T_prev):
-    '''pose prediction for the new frame (motion model, in the camera frame)'''
-    c = self.c
-    if c.motion_model == 'none':
-      return T_prev
-    if c.motion_model == 'accel':     # constant acceleration: the last change of velocity again
-      return orthonormalize(self.acceleration @ self.velocity @ T_prev)
+    '''pose prediction for the new frame (constant velocity, in the camera frame)'''
     return orthonormalize(self.velocity @ T_prev)
 
   def local_keyframes(self, kf, n):
@@ -810,7 +696,7 @@ class SLAM:
       F = Kinv.T @ E @ Kinv
       lines = np.c_[m.pts.ref_uv[self.tr_pt[sel]], np.ones(len(sel))] @ F.T
       d = np.abs(np.sum(lines[:, :2] * self.tr_uv[sel], axis=1) + lines[:, 2]) / np.linalg.norm(lines[:, :2], axis=1)
-      keep[sel[d > self.px_threshold(self.c.epipolar_px, self.c.adaptive_map)]] = False
+      keep[sel[d > self.c.epipolar_px]] = False
     self.keep_tracks(keep)
 
   # ------------------------------------------------------------------------------------------------- search
@@ -903,12 +789,6 @@ class SLAM:
     row = np.full(len(m.pts), -1)
     row[m.obs.pt[o]] = o
     m.obs.uv[row[pts[ok]]] = uv[ok]
-    if c.remeasure_drop_slipped:      # the patch is found, but far from the KLT position: the track slipped
-      slipped = tr[(ncc >= c.remeasure_min_ncc) & ~ok]
-      m.remove_obs(m.obs_of(kfs=[kf], pts=self.tr_pt[slipped]))
-      keep = np.ones(len(self.tr_pt), bool)
-      keep[slipped] = False
-      self.keep_tracks(keep)
 
   def fuse(self, kf, pts, uv):
     '''add found points to the keyframe: merge with a track at the same place, else start a new track'''
@@ -956,7 +836,7 @@ class SLAM:
       kf_row[ks] = np.arange(len(ks))
       X, angle, err, depth = optim.triangulate(self.K, m.kfs.T[ks], kf_row[m.obs.kf[o]], row[m.obs.pt[o]],
                                                m.obs.uv[o], len(cand))
-      ok = np.isfinite(X).all(axis=1) & (depth > 0) & (err <= self.px_threshold(c.tri_max_px, c.adaptive_map))
+      ok = np.isfinite(X).all(axis=1) & (depth > 0) & (err <= c.tri_max_px)
       enough = ok & (angle >= np.deg2rad(c.tri_min_angle))
       m.pts.X[cand[enough]] = X[enough]
       m.pts.state[cand[enough]] = MAPPED
@@ -1068,8 +948,7 @@ class SLAM:
     pt_row[pts] = np.arange(len(pts))
     return ((self.K, m.kfs.T[kfs].copy(), fixed, m.pts.X[pts].copy(), kf_row[m.obs.kf[o]], pt_row[m.obs.pt[o]],
              m.obs.uv[o].copy(), iters),
-            dict(scale_fix=scale_fix, noise=m.kfs.noise[m.obs.kf[o]] if self.c.adaptive_map else None,
-                 loss=self.c.ba_loss))
+            dict(scale_fix=scale_fix))
 
   def bundle_adjust(self, kfs, fixed, pts, o, iters):
     m = self.map
@@ -1108,13 +987,6 @@ class SLAM:
     C = m.covisibility_matrix()
     n_points = C.diagonal()
     for k in candidates:
-      if c.cull_old_redundant and k < kf - c.cull_old_age:
-        # old keyframes thin out (ORB-SLAM's rule, but only outside the recent past): most of their points are
-        # seen by >= 3 other keyframes
-        p = m.points_of(k)
-        if len(p) and np.mean(m.pts.n_obs[p] >= 4) >= c.cull_old_redundancy:
-          self.remove_keyframe(k)
-          continue
       j, shared = C.indices[C.indptr[k]:C.indptr[k + 1]], C.data[C.indptr[k]:C.indptr[k + 1]]
       older = j[(j < k) & (shared >= c.cull_kf_shared * n_points[k]) & m.kfs.alive[j]]
       if n_points[k] < c.kf_min_3d or len(older) == 0:
@@ -1164,8 +1036,6 @@ class SLAM:
       with self.timed('loop'):
         if old.any():
           self.detect_loop(kf, untracked[old])
-        else:
-          self.detect_segment_loop(kf)
     if self.provisional is not None:
       with self.timed('loop'):
         self.refind_old_map(kf)
@@ -1188,7 +1058,6 @@ class SLAM:
     pts, uv = self.search(T, self.pyr, old, c.loop_top_level, c.loop_search_px, np.inf)
     T_loop, inl = self.pnp(uv, m.pts.X[pts]) if len(pts) >= c.loop_min_matches else (None, np.zeros(0, bool))
     if inl.sum() < c.loop_min_inliers:
-      self.detect_segment_loop(kf)
       return
     pts, uv = pts[inl], uv[inl]
     proj, _ = project(self.K, T, m.pts.X[pts])
@@ -1200,25 +1069,6 @@ class SLAM:
       return
     self.close_loop(kf, T_loop, pts, uv, disagreement)
 
-  def detect_segment_loop(self, kf):
-    '''
-    in a new segment the pose of the old map is unknown: try the poses of keyframes of other segments (round-robin)
-    as hypotheses for where we are in the old map
-    '''
-    c, m = self.c, self.map
-    others = np.flatnonzero(m.kfs.alive & (m.kfs.segment != self.segment))
-    if len(others) == 0:
-      return
-    self.segment_cursor += c.reloc_keyframes
-    for k in others[(self.segment_cursor + np.arange(c.reloc_keyframes)) % len(others)]:
-      pts, uv = self.search(m.kfs.T[k], self.pyr, m.points_of(k), 3, 8, np.inf)
-      if len(pts) < 2 * c.loop_min_matches:
-        continue
-      T_loop, inl = self.pnp(uv, m.pts.X[pts], m.kfs.T[k])
-      if inl.sum() >= 2 * c.loop_min_inliers:
-        self.close_loop(kf, T_loop, pts[inl], uv[inl], np.inf)
-        return
-
   def refind_old_map(self, kf):
     '''
     a provisional map part (scale unknown): look for the map before it with the poses of its keyframes as hypotheses
@@ -1228,8 +1078,8 @@ class SLAM:
     c, m = self.c, self.map
     junction, first, old_pts = self.provisional
     old_kfs = np.flatnonzero(m.kfs.alive[:first])
-    self.segment_cursor += c.reloc_keyframes
-    for k in old_kfs[(self.segment_cursor + np.arange(c.reloc_keyframes)) % len(old_kfs)]:
+    self.cursor += c.reloc_keyframes
+    for k in old_kfs[(self.cursor + np.arange(c.reloc_keyframes)) % len(old_kfs)]:
       cand = m.points_of(k)
       cand = cand[cand < len(old_pts)]
       cand = cand[old_pts[cand]]
@@ -1321,9 +1171,7 @@ class SLAM:
         pairs[(int(k), int(j[sel][i]))] = n[sel][i]
       if m.kfs.parent[k] >= 0:
         pairs.setdefault((int(k), int(m.kfs.parent[k])), c.ba_min_covisible)
-    # (the edge to the first keyframe of a segment is a guess: it gets almost no weight)
-    edges = [(row[k], row[j], S[row[k]] @ sim3_inv(S[row[j]]),
-              max(n, c.ba_min_covisible) / 100 * (1 if m.kfs.segment[k] == m.kfs.segment[j] else 1e-4))
+    edges = [(row[k], row[j], S[row[k]] @ sim3_inv(S[row[j]]), max(n, c.ba_min_covisible) / 100)
              for (k, j), n in pairs.items() if m.kfs.alive[k] and m.kfs.alive[j]]
     src = collections.Counter(m.pts.ref[pts].tolist()).most_common(1)[0][0]
     if not m.kfs.alive[src]:
@@ -1345,9 +1193,6 @@ class SLAM:
     i = np.flatnonzero(row[self.traj.ref] >= 0)
     self.traj.T[i, :3, 3] /= np.array([sim3_scale(Sn) for Sn in S_new])[row[self.traj.ref[i]], None]
     self.T_cw = m.kfs.T[kf].copy()
-    if m.kfs.segment[src] != m.kfs.segment[kf]:     # the new segment joins the old one
-      m.kfs.segment[m.kfs.segment == m.kfs.segment[kf]] = m.kfs.segment[src]
-      self.segment = int(m.kfs.segment[src])
     self.diag['loop_closed'] = True
     if self.provisional is not None and src < self.provisional[1]:   # (the provisional part is in the old map now)
       self.provisional = None
@@ -1392,8 +1237,8 @@ class SLAM:
       self.window.append((self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64)))
       if self.initializing:
         with self.timed('init'):
-          if self.initialized and self.relocalize(self.T_cw):    # back on the map: no new segment needed
-            self.abort_segment()
+          if self.initialized and self.relocalize(self.T_cw):    # back on the map
+            self.abort_mapless()
             self.lost, self.T_good = 0, self.T_cw.copy()
           else:
             self.lost += self.initialized
@@ -1415,12 +1260,8 @@ class SLAM:
         if not ok or self.mapped_tracks().sum() < c.reloc_min_3d:
           with self.timed('relocalize'):
             ok = self.relocalize(self.T_cw if ok else T_pred) or ok
-        if ok and c.track_local_map:
-          with self.timed('local_map'):
-            self.track_local_map()
         if ok:
           velocity = orthonormalize(self.T_cw @ inv_pose(T_prev)) if not self.lost else np.eye(4)
-          self.acceleration = velocity @ inv_pose(self.velocity)
           self.velocity = velocity
           self.lost = 0
           self.T_good = self.T_cw.copy()
@@ -1433,8 +1274,6 @@ class SLAM:
             self.velocity = np.eye(4)
           if c.mapless:
             self.start_mapless()
-          if c.reinit and self.lost > c.reinit_after:
-            self.start_segment()
         self.epipolar_filter()
         if not self.initializing and self.need_keyframe():
           with self.timed('keyframe'):
