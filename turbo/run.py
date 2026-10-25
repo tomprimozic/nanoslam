@@ -57,6 +57,12 @@ def perturbed(seed, factor=1.4):
   return overrides
 
 
+def frame_range(x, metrics, n):
+  '''the frames of a saved run (older runs without "start" went to the end of the sequence)'''
+  start = metrics.get('start')
+  return x[start:start + n] if start is not None else x[-n:]
+
+
 def lost_flags(n, frames, lost):
   '''per-frame "tracking lost" flags from the per-frame stats'''
   flags = np.zeros(n, bool)
@@ -91,7 +97,7 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
   for e in slam.events:
     events[e['type']] = events.get(e['type'], 0) + 1
   result = {
-    'name': name, 'frames': n, 'seconds': elapsed, 'fps': n / elapsed,
+    'name': name, 'frames': n, 'start': start, 'seconds': elapsed, 'fps': n / elapsed,
     'final': {k: v for k, v in m_final.items() if not k.startswith('_')},
     'online': {k: v for k, v in m_online.items() if not k.startswith('_')},
     'keyframes': int(slam.map.kfs.alive.sum()), 'keyframes_created': len(slam.map.kfs),
@@ -162,7 +168,7 @@ def summary(run_dirs, metrics=('final', 'rot', 'drift', 'ate', 'lost_episodes', 
       t = np.load(f.parent / 'trajectory.npz')
       r = json.loads((f.parent / 'metrics.json').read_text())
       key = 'online_poses' if trajectory == 'online' else 'poses'
-      gt = [x[-len(t['final']):] for x in gts[name]]
+      gt = [frame_range(x, r, len(t['final'])) for x in gts[name]]
       R = (t[key][:, :3, :3], gt[1]) if key in t else (None, None)
       lost = lost_flags(len(t['final']), t['stats_frame'], t['stats_lost']) if 'stats_lost' in t else None
       runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gt[0], est_R=R[0], gt_R=R[1], lost=lost)
@@ -227,7 +233,7 @@ def view(run_dirs, save=None):
   for d in map(Path, run_dirs):
     name = d.name.split('@')[0]
     t = np.load(d / 'trajectory.npz')
-    gt = datasets.load(name).gt[-len(t['final']):, :3, 3]
+    gt = frame_range(datasets.load(name).gt, json.loads((d / 'metrics.json').read_text()), len(t['final']))[:, :3, 3]
     rr.log(f'{d.name}/gt', rr.LineStrips3D([gt[np.isfinite(gt).all(axis=1)]], radii=0.004, colors=[150, 150, 150]),
            static=True)
     for coverage, color in [(0.1, [0, 120, 255]), (0.2, [255, 140, 0])]:
