@@ -64,17 +64,23 @@ and when found the part gets the old map's scale and pose (the loop closure's po
 Sim3 of the whole part). Regimes are decided intrinsically: PnP failure, the likelihood ratio, the number of scale
 points.
 
-**Initialization** (`try_initialize_window`; the design follows `../../slamfold/DESIGN.md`). Until translation is
+**Initialization** (`try_initialize`; the design follows `../../slamfold/DESIGN.md`). Until translation is
 established the system tracks like a rotation-only one: every frame gets the *rotation-only* pose (robust Wahba on
 the bearings of the tracks w.r.t. the last keyframe, position held), and when fewer than 70% of the tracks survive a
 keyframe is made at that pose with new corners (`pre_keyframe`), so orientation carries through e.g. turning 90 deg
 and then moving. The translation test is relative to an *anchor* keyframe - the first one, until fewer than 50 of its
-points are tracked, then the newest one: every frame (once the median parallax is >= 0.5 deg) a batch BA runs over the
-frames since the anchor, up to 20 of them chosen evenly in parallax (a long still start collapses to a few): rotations
+points are tracked, then the newest one: every frame a batch BA runs over the frames since the anchor, up to 20 of them chosen evenly in parallax (a long still start collapses to a few): rotations
 start from the rotation-only solution of each frame, translations from the 5-point direction scaled by the frame's
-parallax, points from two-view triangulation; gauge = anchor fixed + scale along the baseline. Translation counts as
-established when the likelihood ratio of the full model against the rotation-only one exceeds 2x its extra
-parameters and >= 50 points (and >= half of the inliers) have >= 1 deg of parallax; the window's points seed the map,
+parallax, points from two-view triangulation; gauge = anchor fixed + scale along the baseline. Translation is
+established by slamfold's test (`translation_test`): the likelihood ratio of the full model against the nested
+rotation-only one, with every landmark's inverse depth integrated out (quadrature on a per-landmark grid, flat prior)
+and its host bearing integrated (Laplace), Huber per observation, above 2x the null of 1.5 x half a nat per extra pose
+parameter. Two changes for real data: the translation magnitude, which the BA's gauge fixes, is set to the optimum of
+the integrated likelihood (a 1-D search over the prior's support; slamfold optimizes t), and the noise level comes from
+the rotation-only residuals (unbiased without translation; slamfold assumes it known). The map is made once >= 50
+points (and >= half of the inliers) have >= 1 deg of parallax - slamfold's "resolved depth" rule (posterior std < 20%
+of the mean) seeded maps from 1-5 mm baselines whose depths were overconfident (correlated KLT errors), doubling the
+early error. The window's points seed the map,
 the last frame becomes the second keyframe, the other pre-translation keyframes leave the map (their positions were
 only assumed) and the window's frames get their poses with hindsight. Compared with the two-view initialization
 (5-point + 2.5 deg median parallax) it initializes earlier where the start is slow (household frame 14 vs 61, MH_05
@@ -153,7 +159,7 @@ so with 5 starts x 17 sequences effects below ~15% are not resolvable.
 seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
 [m], *rot* = rotation drift [deg], *ATE* = whole-trajectory alignment [m]. *full* = the default system, *VO* =
 `loop=False final_ba_iters=0` (no loop closing). One config for all 22 sequences; only the camera calibration comes
-from the dataset. (`runs/n_ml_seed*`, `runs/n_ml_vo_seed*`; the TUM fr1 sequences were added here, so the geometric
+from the dataset. (`runs/r_marg_seed*`, `runs/r_marg_vo_seed*`; the TUM fr1 sequences were added here, so the geometric
 means are not comparable with the 17-sequence ones in the experiment log). *lost* = tracking losses (mean over the runs;
 the system's own flag: frames without map tracking, see "Lost = initializing with a map"). Poses
 are emitted from the first frame; the initial section for the alignment starts where the estimate first moves (before
@@ -161,29 +167,29 @@ translation is established positions are held, see Initialization).
 
 | sequence | final (full) | rot (full) | ATE (full) | final (VO) | rot (VO) | ATE (VO) | lost: episodes / frames |
 |---|---|---|---|---|---|---|---|
-| fr1/360 | 1.454 | 26.05 | 0.184 | 1.454 | 27.80 | 0.184 | 9.5 / 10.9% |
-| fr1/desk2 | 0.269 | 4.10 | 0.083 | 0.269 | 7.07 | 0.108 | 2.0 / 2.1% |
-| fr1/room | 0.195 | 2.63 | 0.354 | 0.206 | 3.69 | 0.392 | 2.0 / 1.0% |
-| fr1/rpy | 0.082 | 5.05 | 0.040 | 0.082 | 7.03 | 0.040 | 5.0 / 4.6% |
-| fr1/xyz | 0.018 | 0.92 | 0.011 | 0.014 | 0.92 | 0.011 | 0.0 / 0.0% |
+| fr1/360 | 0.687 | 32.40 | 0.174 | 0.687 | 32.40 | 0.174 | 9.5 / 9.1% |
+| fr1/desk2 | 0.214 | 3.70 | 0.092 | 0.378 | 7.42 | 0.097 | 2.0 / 2.4% |
+| fr1/room | 0.190 | 2.87 | 0.478 | 0.233 | 3.69 | 0.490 | 2.0 / 1.0% |
+| fr1/rpy | 0.109 | 5.46 | 0.039 | 0.109 | 7.29 | 0.039 | 6.0 / 6.2% |
+| fr1/xyz | 0.018 | 0.89 | 0.011 | 0.014 | 0.92 | 0.011 | 0.0 / 0.0% |
 | fr2/desk | 0.009 | 1.21 | 0.013 | 0.025 | 1.42 | 0.014 | 0.0 / 0.0% |
-| fr3/long_office_household | 0.011 | 0.77 | 0.034 | 0.152 | 2.46 | 0.051 | 0.0 / 0.0% |
+| fr3/long_office_household | 0.018 | 0.95 | 0.036 | 0.146 | 2.15 | 0.050 | 0.0 / 0.0% |
 | MH_01_easy | 0.039 | 3.51 | 0.022 | 0.210 | 3.73 | 0.085 | 0.0 / 0.0% |
 | MH_02_easy | 0.034 | 1.17 | 0.034 | 0.136 | 1.23 | 0.048 | 0.0 / 0.0% |
 | MH_03_medium | 0.021 | 1.78 | 0.050 | 0.195 | 0.91 | 0.153 | 0.0 / 0.0% |
-| MH_04_difficult | 0.078 | 0.31 | 0.075 | 0.225 | 0.74 | 0.135 | 0.0 / 0.0% |
-| MH_05_difficult | 0.102 | 0.97 | 0.074 | 0.302 | 0.90 | 0.140 | 0.0 / 0.0% |
-| V1_01_easy | 0.072 | 3.28 | 0.035 | 0.090 | 3.61 | 0.054 | 0.0 / 0.0% |
-| V1_02_medium | 0.016 | 0.34 | 0.015 | 0.204 | 3.73 | 0.142 | 0.0 / 0.0% |
-| V1_03_difficult | 0.059 | 0.77 | 0.035 | 0.166 | 6.41 | 0.075 | 0.0 / 0.0% |
-| V2_01_easy | 0.011 | 0.34 | 0.036 | 0.244 | 1.14 | 0.066 | 0.0 / 0.0% |
-| V2_02_medium | 0.063 | 2.02 | 0.037 | 0.220 | 3.85 | 0.077 | 0.0 / 0.0% |
-| V2_03_difficult | 0.352 | 2.16 | 0.686 | 0.451 | 2.04 | 0.792 | 6.0 / 3.0% |
+| MH_04_difficult | 0.070 | 0.30 | 0.077 | 0.225 | 0.74 | 0.135 | 0.0 / 0.0% |
+| MH_05_difficult | 0.098 | 0.92 | 0.069 | 0.303 | 0.90 | 0.140 | 0.0 / 0.0% |
+| V1_01_easy | 0.072 | 3.28 | 0.035 | 0.094 | 3.61 | 0.054 | 0.0 / 0.0% |
+| V1_02_medium | 0.012 | 0.30 | 0.014 | 0.203 | 3.73 | 0.142 | 0.0 / 0.0% |
+| V1_03_difficult | 0.072 | 0.76 | 0.042 | 0.163 | 6.29 | 0.075 | 0.0 / 0.0% |
+| V2_01_easy | 0.014 | 0.34 | 0.036 | 0.244 | 1.14 | 0.066 | 0.0 / 0.0% |
+| V2_02_medium | 0.050 | 2.08 | 0.029 | 0.218 | 3.85 | 0.077 | 0.0 / 0.0% |
+| V2_03_difficult | 0.243 | 2.77 | 0.679 | 0.451 | 2.04 | 0.792 | 6.0 / 3.2% |
 | abandonedfactory P001 | 0.435 | 10.49 | 0.081 | 0.435 | 10.49 | 0.081 | 1.0 / 0.9% |
 | carwelding P007 | 0.304 | 0.53 | 0.126 | 0.530 | 0.67 | 0.150 | 0.0 / 0.0% |
-| seasidetown P003 | 5.415 | 26.16 | 1.868 | 5.415 | 26.16 | 1.868 | 1.0 / 3.1% |
+| seasidetown P003 | 2.593 | 19.22 | 0.571 | 2.593 | 19.22 | 0.571 | 1.0 / 3.1% |
 | seasonsforest P002 | 0.479 | 0.25 | 0.081 | 0.479 | 0.25 | 0.081 | 0.0 / 0.0% |
-| **geometric mean** | **0.091** | **1.70** | **0.064** | **0.226** | **2.62** | **0.101** | |
+| **geometric mean** | **0.085** | **1.72** | **0.061** | **0.218** | **2.60** | **0.096** | |
 
 - With hindsight (`--trajectory final`: keyframe poses after all loop closures and the final BA) the full system's
   ATE is ~2x lower (geometric mean ~3.8 cm in the first round); live is what a robot would have had.
@@ -271,6 +277,8 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | when lost: a new map part from the rotation-only pose with the tracks continued (instead of waiting to relocalize) | 360 tracked 5 -> 95%, but the new part's scale is off (median-depth guess, 0.3-0.6x) and it stops relocalizing against the old map: room 0.09 -> 1.1 m, V2_03 0.18 -> 1.35 m | not kept (see Next) |
 | when lost: rotation-only poses from tracks of their own (map untouched; validity: half the tracks within 3 px), also the first relocalization hypothesis, 22 sequences, 2 seeds | rotation 0.92 [0.79, 1.01] (360 72 -> 24 deg, rpy 6.0 -> 2.3, desk2 25 -> 29), final 0.98 [0.96, 1.00]; sequences that never lose track unchanged; without the validity check abandonedfactory's dark last frames give 10.8 deg instead of 2.6 | adopted |
 | review fixes: background BA corrections propagated in the world frame (were camera-frame), loop pose re-estimated after merging a pending BA, frames between keyframes rescaled with loop corrections, frames of dropped pre-init keyframes re-expressed; summaries use the saved frame range, full, 2 seeds | live: final 1.01 [0.95, 1.08], ATE 0.99; hindsight: ATE 0.95 [0.90, 0.99], final 0.93 [0.79, 1.05]; VO unchanged | fixed |
+| translation test: depths integrated out (slamfold) instead of MAP depths, map seeded with slamfold's resolved depths, no parallax gate, 22 sequences, 2 seeds | inits at 1-5 mm of baseline (mean frame 10 vs 26), early error 0.40 -> 0.87% of the path; full final 1.46 [1.15, 1.99], VO 1.26 [1.02, 1.72] | no (seeding) |
+| ... with the map seeded by the parallax rule as before | full final 0.92 [0.83, 1.00], ATE 0.96; VO final 0.97 [0.86, 1.06], ATE 0.95 [0.84, 1.02]; pre-init rotation error 0.42 -> 0.27 deg; same init frames; ~22 ms per pre-init frame (the test: 6 ms) | adopted |
 | lost = initializing with a map (anchor = last keyframe; continue / provisional part merged by Sim3 when the old map is found), instead of the rotation tracker + relocalization, 22 sequences, 2 seeds | lost frames 13.4 -> 1.2%; full final 0.99 [0.85, 1.15], ATE 0.88 [0.69, 1.01], rotation 0.95; desk2 0.74 -> 0.27 m (29 -> 4 deg), seasidetown 10.1 -> 5.4 m; 360 0.49 -> 1.45 m, rpy rotation 2.3 -> 5.1 deg; room / V2_03 about the same (merged after 100s of frames, provisional scale off by up to 10x) | adopted |
 | live pose from the window BA once the translation test passes (until the map conditions do), 22 sequences, 2 seeds | pre-init rotation error 1.06 -> 0.42 deg (median of the max per run), jump at initialization 1.00 -> 0.17 deg; downstream full final 1.04 [0.96, 1.14], rotation 0.96 [0.89, 1.04], VO final 1.03 [0.96, 1.11] | adopted |
 | V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |
@@ -294,8 +302,9 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
   anchor further back with more map points, or the old points as fixed points in the window BA; the KLT
   forward-backward check (0.5 px) drops ~60% of the new corners per frame under blur (desk2), but a threshold relative
   to the frame breaks texture-poor scenes; dark scenes (abandonedfactory's end) need their own mode;
-- initialization beyond the window BA: the depth-integrated (marginal) likelihood of slamfold instead of MAP depths,
-  small-motion (DfUSMC-style) depth for the very first frames;
+- initialization: the window BA's poses from the integrated likelihood itself (now MAP poses, the integration only
+  for the test), a per-track noise model so that resolved depths become trustworthy (then the map could start at
+  slamfold's resolution instead of 1 deg of parallax);
 - cheaper global BA: it is 1-4 s for 300-600 keyframes (the LM loop in Python competes for the GIL with tracking;
   move the whole LM into numba, fewer iterations, or only the loop's region) - the remaining latency spikes;
 - the chaos is mostly the random walk of the drift itself (max / min over start frames of a random walk's endpoint
