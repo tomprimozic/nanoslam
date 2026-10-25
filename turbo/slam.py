@@ -525,6 +525,7 @@ class SLAM:
     self.events.append({'type': 'init', 'frame': self.frame, 'segment': self.segment, 'points': int(len(good_pts))})
 
   def restart_initialization(self):
+    self.events.append({'type': 'init_restart', 'frame': self.frame})
     if not self.initialized:
       return self.reset()
     k = self.last_kf
