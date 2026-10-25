@@ -45,7 +45,12 @@ class Config:
   detect_blur = True                # 3x3 blur before the corner score (OV2SLAM)
 
   # initialization
-  init_parallax = 2.5               # deg, median (not rotation compensated)
+  init_mode = 'window'              # 'window': batch BA over the frames since the first keyframe; 'twoview'
+  init_parallax = 2.5               # deg, median (not rotation compensated), twoview
+  init_window = 20                  # frames in the window BA (subsampled)
+  init_check_parallax = 0.5         # deg, median parallax before a window init is attempted
+  init_ratio = 2.0                  # translation established: likelihood ratio full vs rotation-only > this x extra params
+  rotation_only_poses = False       # before initialization: emit rotation-only poses (t = 0) instead of nothing
   init_min_points = 50
   init_min_ratio = 0.5              # fraction of inliers with parallax (rejects rotation-dominated motion)
 
@@ -146,6 +151,7 @@ class SLAM:
     self.segment = 0                  # map segment (a new one starts when tracking is lost and we re-initialize)
     self.initializing = True          # waiting for two-view initialization (of the first map or a new segment)
     self.good_depth = 1.0             # median depth of the tracked points at the last good frame
+    self.window = []                  # while initializing: (frame, point ids, pixels) of every frame since the first keyframe
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
     self.segment_cursor = 0           # round-robin position of the loop search across segments
@@ -159,7 +165,7 @@ class SLAM:
     # per frame diagnostics (intrinsic: no ground truth involved)
     self.stats = Table(frame=(np.int64, (), -1), tracks=(np.int32, (), 0), mapped=(np.int32, (), 0),
                        far=(np.int32, (), 0), inliers=(np.int32, (), 0), sigma=(np.float32, (), np.nan),
-                       phase_response=(np.float32, (), np.nan),
+                       phase_response=(np.float32, (), np.nan), init_ratio=(np.float32, (), np.nan),
                        flow=(np.float32, (), np.nan), blur=(np.float32, (), np.nan), lost=(np.int32, (), 0),
                        keyframe=(bool, (), False), loop_search=(bool, (), False), loop_closed=(bool, (), False),
                        keyframes=(np.int32, (), 0), points=(np.int32, (), 0),
@@ -321,6 +327,161 @@ class SLAM:
   # ------------------------------------------------------------------------------------------------- initialization
 
   def try_initialize(self):
+    self.window.append((self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64)))
+    if self.c.init_mode == 'window':
+      return self.try_initialize_window()
+    return self.try_initialize_twoview()
+
+  def rotation_only(self, uv_ref, uv, iterations=3):
+    '''
+    rotation R (x = R x_ref) that best explains the bearings of a pure rotation (Wahba, IRLS with a Huber weight);
+    returns R and the re-projection residuals [px] of the rotation-only model
+    '''
+    b0 = unproject(self.K, uv_ref)
+    b0 /= np.linalg.norm(b0, axis=1, keepdims=True)
+    b1 = unproject(self.K, uv)
+    b1 /= np.linalg.norm(b1, axis=1, keepdims=True)
+    w = np.ones(len(b0))
+    for _ in range(iterations):
+      U, _, VT = np.linalg.svd((b1 * w[:, None]).T @ b0)
+      R = U @ np.diag([1, 1, np.linalg.det(U @ VT)]) @ VT
+      p = b0 @ R.T
+      res = np.linalg.norm(p[:, :2] / p[:, 2:] * [self.K[0, 0], self.K[1, 1]] + self.K[:2, 2] - uv, axis=1)
+      w = np.where(res <= optim.HUBER, 1.0, optim.HUBER / np.maximum(res, 1e-9))
+    return R, res
+
+  def try_initialize_window(self):
+    '''
+    batch BA over the frames since the first keyframe (subsampled), started from the rotation-only rotations and the
+    two-view translation direction; initialized once the rotation-only model clearly explains the tracks worse than the
+    full one (residual scale ratio, a likelihood ratio without the noise level) and enough points have parallax
+    '''
+    c, m = self.c, self.map
+    kf0 = self.last_kf
+    if len(self.tr_pt) < c.init_min_points:
+      return self.restart_initialization()
+    ref = m.pts.ref_uv[self.tr_pt]
+    cur = self.tr_uv.astype(np.float64)
+    if np.median(np.linalg.norm(cur - ref, axis=1)) < self.px(c.init_check_parallax):
+      return
+    pose, info = poselib.estimate_relative_pose(ref, cur, self.camera, self.camera,
+                                                {'max_epipolar_error': 1.0, 'success_prob': 0.9999,
+                                                 'seed': c.ransac_seed}, {})
+    inl = np.array(info['inliers'], bool)
+    pts = self.tr_pt[inl]
+    n = len(pts)
+    if n < c.init_min_points:
+      return
+    T_last = make_pose(pose.R, pose.t)
+    row_all = np.full(len(m.pts), -1)
+    row_all[self.tr_pt] = np.arange(len(self.tr_pt))
+    ref_all = ref
+    X, _, _, depth = optim.triangulate(self.K, np.array([np.eye(4), T_last]), np.r_[np.zeros(n, int), np.ones(n, int)],
+                                       np.r_[np.arange(n), np.arange(n)], np.r_[ref[inl], cur[inl]], n)
+    ok = np.isfinite(X).all(axis=1) & (depth > 0)
+    if ok.sum() < c.init_min_points:
+      return
+    # robust depths: points behind / too far are placed at a large depth along their ray
+    med = np.median(X[ok, 2])
+    rays = unproject(self.K, ref[inl])
+    z = np.clip(np.where(ok, X[:, 2], 100 * med), 0.05 * med, 100 * med)
+    X = rays * z[:, None]
+    # frames of the window: evenly spread in parallax (a long still start collapses to a few frames)
+    par_all = np.array([np.median(np.linalg.norm(xy[k >= 0] - ref_all[k[k >= 0]], axis=1)) if (k := row_all[ids]).max() >= 0
+                        else 0.0 for _, ids, xy in self.window])
+    targets = np.linspace(0, par_all[-1], c.init_window)
+    sel = np.unique(np.r_[0, np.searchsorted(np.maximum.accumulate(par_all), targets), len(self.window) - 1])
+    sel = sel[sel < len(self.window)]
+    frames = [self.window[i] for i in sel]
+    row = np.full(len(m.pts), -1)
+    row[pts] = np.arange(n)
+    cam, pt, uv = [], [], []
+    for j, (_, ids, xy) in enumerate(frames):
+      k = row[ids]
+      have = k >= 0
+      cam.append(np.full(have.sum(), j)); pt.append(k[have]); uv.append(xy[have])
+    cam, pt, uv = np.concatenate(cam), np.concatenate(pt), np.concatenate(uv)
+    # initial poses: rotation-only rotations, translations along the two-view baseline in proportion to the parallax
+    ref_of = ref[inl][pt]
+    T = np.tile(np.eye(4), (len(frames), 1, 1))
+    res_rot = []
+    par = []
+    for j in range(len(frames)):
+      o = cam == j
+      R, res = self.rotation_only(ref_of[o], uv[o])
+      T[j, :3, :3] = R
+      res_rot.append(res)
+      par.append(np.median(np.linalg.norm(uv[o] - ref_of[o], axis=1)))
+    par = np.array(par)
+    T[:, :3, 3] = T_last[:3, 3] * (par / max(par[-1], 1e-9))[:, None]
+    T[-1] = T_last
+    fixed = np.zeros(len(frames), bool)
+    fixed[0] = True
+    baseline = T_last[:3, :3] @ camera_center(T_last)
+    with self.timed('ba'):
+      T, X, e2 = optim.bundle_adjust(self.K, T, fixed, X, cam, pt, uv, 15,
+                                     scale_fix=(len(frames) - 1, int(np.argmax(np.abs(baseline)))))
+    # translation test: likelihood ratio of the full model vs the rotation-only one (robust costs in units of the
+    # full model's residual scale), against the parameters the full model has in addition (translations + depths)
+    sigma = max(1.4826 * np.median(np.sqrt(e2[np.isfinite(e2)])), 0.1)
+    rr = np.concatenate(res_rot) / sigma
+    rf = np.sqrt(np.minimum(e2, 1e6)) / sigma
+    huber = lambda r: np.where(r <= optim.HUBER, 0.5 * r ** 2, optim.HUBER * (r - 0.5 * optim.HUBER))
+    dF = float(huber(rr).sum() - huber(rf).sum())
+    extra = 3 * (len(frames) - 1) + n
+    # per point: inlier in the first and the last frame (a glitch in an intermediate frame is just a lost observation),
+    # in front, parallax
+    bad = np.zeros(n, bool)
+    ends = (cam == 0) | (cam == len(frames) - 1)
+    np.logical_or.at(bad, pt[ends], ~(e2[ends] <= optim.CHI2_2D))
+    centers = camera_center(T)
+    angle = np.zeros(n)
+    for j in range(1, len(frames)):
+      a, b = X - centers[0], X - centers[j]
+      cos = np.sum(a * b, axis=1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12)
+      angle = np.maximum(angle, np.arccos(np.clip(cos, -1, 1)))
+    good = ~bad & (X[:, 2] > 0)
+    good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
+    self.diag['init_ratio'] = dF / extra
+    if (dF < c.init_ratio * extra or good_angle.sum() < c.init_min_points
+        or good_angle.sum() < c.init_min_ratio * good.sum()):
+      return
+    s = self.good_depth / np.median(X[good_angle, 2])
+    T[:, :3, 3] *= s
+    X = X * s
+    T0 = m.kfs.T[kf0]
+    self.T_cw = self.T_good = T[-1] @ T0
+    self.velocity = np.eye(4)
+    keep = np.zeros(len(m.pts), bool)
+    keep[pts[good]] = True
+    self.keep_tracks(keep[self.tr_pt])
+    m.kill(np.setdiff1d(m.points_of(kf0, CANDIDATE), self.tr_pt))
+    kf1 = self.add_keyframe(self.T_cw)
+    good_pts = pts[good_angle]
+    m.pts.X[good_pts] = transform(inv_pose(T0), X[good_angle])
+    m.pts.state[good_pts] = MAPPED
+    # hindsight: the frames since the first keyframe get poses from the window solution (refined on its points)
+    Xw = X[good_angle]
+    for f, ids, xy in self.window[1:-1]:
+      k = row[ids]
+      have = (k >= 0) & good_angle[np.maximum(k, 0)]
+      if have.sum() < c.pnp_min_inliers:
+        continue
+      j = np.searchsorted(np.array([fr[0] for fr in frames]), f)
+      T_init = T[min(j, len(frames) - 1)]
+      T_f, _ = optim.refine_pose(self.K, T_init, Xw[np.searchsorted(np.flatnonzero(good_angle), k[have])], xy[have])
+      i = np.flatnonzero(self.traj.frame == f)
+      if len(i):
+        self.traj.T[i] = T_f @ T0 @ inv_pose(m.kfs.T[self.traj.ref[i]])
+    self.window = []
+    self.initialized, self.initializing, self.lost = True, False, 0
+    self.local_ba(kf1)
+    self.detect(kf1)
+    self.kf_n3d = int(self.mapped_tracks().sum())
+    self.events.append({'type': 'init', 'frame': self.frame, 'segment': self.segment, 'points': int(len(good_pts)),
+                        'frames': len(frames), 'ratio': dF / extra})
+
+  def try_initialize_twoview(self):
     '''
     two-view initialization from the tracks of the last keyframe (the first one of the map or of a new segment, whose
     pose is then the last good pose): relative pose, triangulation, scale = median depth 1 (first map) / the depth
@@ -377,6 +538,7 @@ class SLAM:
     self.last_kf = -1
     kf = self.add_keyframe(np.eye(4))
     self.detect(kf)
+    self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
 
   def start_segment(self, new=True):
     '''tracking is lost for good: start a new map segment at the last good pose (joined to the map by a loop later)'''
@@ -387,6 +549,7 @@ class SLAM:
     self.initializing = True
     kf = self.add_keyframe(self.T_good)
     self.detect(kf)
+    self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
 
   def abort_segment(self):
     '''relocalized on the map while initializing a new segment: drop it'''
@@ -1039,6 +1202,12 @@ class SLAM:
           else:
             self.lost += self.initialized
             self.try_initialize()
+            if self.initializing and not self.initialized and c.rotation_only_poses and len(self.tr_pt) >= c.init_min_points:
+              # no translation yet: the best pose is the rotation-only one (position of the first keyframe)
+              R, _ = self.rotation_only(self.map.pts.ref_uv[self.tr_pt], self.tr_uv.astype(np.float64))
+              self.T_cw = make_pose(R, np.zeros(3)) @ self.map.kfs.T[self.last_kf]
+              self.traj.add(1, frame=index, ref=self.last_kf, T=self.T_cw @ inv_pose(self.map.kfs.T[self.last_kf]),
+                            online=inv_pose(self.T_cw))
       else:
         with self.timed('pose'):
           ok = self.estimate_pose(T_pred)

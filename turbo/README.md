@@ -50,6 +50,19 @@ than 50 map points are tracked: *relocalization by projection* (local map, wide 
 rotation + motion blur, e.g. V2_03): several pose hypotheses, DSO-style: the last good pose rotated by +-15 / 30 deg,
 then, round-robin, all keyframe poses (nearest first), each searched with its own points.
 
+**Initialization** (`try_initialize_window`; the design follows `../../slamfold/DESIGN.md`). Corners detected in the
+first frame are tracked; every frame (once their median parallax is >= 0.5 deg) a batch BA runs over the frames since
+then, up to 20 of them chosen evenly in parallax (a long still start collapses to a few): rotations start from the
+*rotation-only* solution of each frame (robust Wahba on the bearings), translations from the 5-point direction scaled
+by the frame's parallax, points from two-view triangulation; gauge = first frame fixed + scale along the baseline.
+Translation counts as established when the likelihood ratio of the full model against the rotation-only one exceeds
+2x its extra parameters and >= 50 points (and >= half of the inliers) have >= 1 deg of parallax; the window's points
+seed the map, the last frame becomes the second keyframe, and the earlier frames get their poses with hindsight.
+Compared with the two-view initialization (5-point + 2.5 deg median parallax) it initializes earlier where the start
+is slow (household frame 14 vs 61, MH_05 42 vs 80) with the same early accuracy (first 150 frames: position 1.00x,
+rotation 0.86x); downstream it is neutral (final 0.98 [0.88, 1.07]). `rotation_only_poses=True` also emits the
+rotation-only pose (t = 0) for every frame before that.
+
 **Patch alignment** (`lk.py`). The template comes from a keyframe that observed the point: sampled around that
 observation, warped with the local affine approximation of the homography of the plane through the point
 (fronto-parallel in the keyframe), from the pyramid level whose resolution matches the target level. Inverse
@@ -120,29 +133,29 @@ so with 5 starts x 17 sequences effects below ~15% are not resolvable.
 seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
 [m], *rot* = rotation drift [deg], *ATE* = whole-trajectory alignment [m]. *full* = the default system, *VO* =
 `loop=False final_ba_iters=0` (no loop closing). One config for all 17 sequences; only the camera calibration comes
-from the dataset. (`runs/x_final_seed*`, `runs/v_final_vo_seed*`). *lost* = tracking losses after initialization
+from the dataset. (`runs/f_final_seed*`, `runs/f_final_vo_seed*`). *lost* = tracking losses after initialization
 (mean over the runs; frames before initialization are not counted).
 
 | sequence | final (full) | rot (full) | ATE (full) | final (VO) | rot (VO) | ATE (VO) | lost: episodes / frames |
 |---|---|---|---|---|---|---|---|
-| fr2/desk | 0.010 | 1.26 | 0.012 | 0.029 | 1.36 | 0.014 | 0.0 / 0.0% |
-| fr3/long_office_household | 0.013 | 0.87 | 0.033 | 0.154 | 2.48 | 0.049 | 0.0 / 0.0% |
-| MH_01_easy | 0.039 | 3.51 | 0.028 | 0.207 | 3.72 | 0.083 | 0.0 / 0.0% |
-| MH_02_easy | 0.043 | 1.16 | 0.035 | 0.143 | 1.32 | 0.048 | 0.0 / 0.0% |
-| MH_03_medium | 0.022 | 1.82 | 0.045 | 0.252 | 0.89 | 0.158 | 0.0 / 0.0% |
-| MH_04_difficult | 0.086 | 0.34 | 0.082 | 0.171 | 0.47 | 0.116 | 0.0 / 0.0% |
-| MH_05_difficult | 0.091 | 0.83 | 0.078 | 0.233 | 0.98 | 0.132 | 0.0 / 0.0% |
-| V1_01_easy | 0.074 | 3.30 | 0.035 | 0.110 | 3.48 | 0.053 | 0.0 / 0.0% |
-| V1_02_medium | 0.016 | 0.49 | 0.018 | 0.154 | 2.74 | 0.121 | 0.0 / 0.0% |
-| V1_03_difficult | 0.069 | 1.12 | 0.041 | 0.159 | 6.73 | 0.076 | 0.0 / 0.0% |
-| V2_01_easy | 0.013 | 0.34 | 0.033 | 0.230 | 1.13 | 0.062 | 0.0 / 0.0% |
-| V2_02_medium | 0.048 | 2.08 | 0.027 | 0.235 | 3.96 | 0.082 | 0.0 / 0.0% |
-| V2_03_difficult | 0.173 | 2.32 | 0.625 | 0.340 | 3.45 | 0.685 | 2.7 / 10.4% |
-| abandonedfactory P001 | 0.808 | 7.69 | 0.223 | 0.808 | 7.69 | 0.223 | 1.0 / 2.3% |
-| carwelding P007 | 0.291 | 0.68 | 0.102 | 0.431 | 0.59 | 0.120 | 0.0 / 0.0% |
-| seasidetown P003 | 5.970 | 132.80 | 2.879 | 5.970 | 132.80 | 2.879 | 1.0 / 75.0% |
-| seasonsforest P002 | 0.293 | 0.18 | 0.079 | 0.293 | 0.18 | 0.079 | 0.0 / 0.0% |
-| **geometric mean** | **0.078** | **1.49** | **0.066** | **0.245** | **2.21** | **0.112** | |
+| fr2/desk | 0.008 | 1.16 | 0.011 | 0.025 | 1.35 | 0.013 | 0.0 / 0.0% |
+| fr3/long_office_household | 0.012 | 0.75 | 0.031 | 0.139 | 2.23 | 0.045 | 0.0 / 0.0% |
+| MH_01_easy | 0.031 | 3.55 | 0.022 | 0.219 | 3.73 | 0.084 | 0.0 / 0.0% |
+| MH_02_easy | 0.039 | 1.16 | 0.036 | 0.131 | 1.30 | 0.044 | 0.0 / 0.0% |
+| MH_03_medium | 0.022 | 1.84 | 0.049 | 0.161 | 0.98 | 0.148 | 0.0 / 0.0% |
+| MH_04_difficult | 0.079 | 0.30 | 0.077 | 0.173 | 0.59 | 0.120 | 0.0 / 0.0% |
+| MH_05_difficult | 0.064 | 1.09 | 0.059 | 0.235 | 0.78 | 0.128 | 0.0 / 0.0% |
+| V1_01_easy | 0.072 | 3.30 | 0.035 | 0.101 | 3.55 | 0.057 | 0.0 / 0.0% |
+| V1_02_medium | 0.015 | 0.41 | 0.016 | 0.200 | 3.81 | 0.145 | 0.0 / 0.0% |
+| V1_03_difficult | 0.065 | 0.73 | 0.048 | 0.203 | 6.76 | 0.085 | 0.0 / 0.0% |
+| V2_01_easy | 0.013 | 0.36 | 0.035 | 0.242 | 1.15 | 0.065 | 0.0 / 0.0% |
+| V2_02_medium | 0.059 | 2.03 | 0.029 | 0.301 | 3.70 | 0.089 | 0.0 / 0.0% |
+| V2_03_difficult | 0.197 | 2.04 | 0.640 | 0.427 | 3.90 | 0.629 | 1.9 / 9.3% |
+| abandonedfactory P001 | 0.383 | 2.61 | 0.077 | 0.383 | 2.61 | 0.077 | 1.0 / 0.9% |
+| carwelding P007 | 0.293 | 0.52 | 0.129 | 0.548 | 0.66 | 0.150 | 0.0 / 0.0% |
+| seasidetown P003 | 9.207 | 101.42 | 3.105 | 9.207 | 101.42 | 3.105 | 1.0 / 57.1% |
+| seasonsforest P002 | 0.489 | 0.27 | 0.082 | 0.489 | 0.27 | 0.082 | 0.0 / 0.0% |
+| **geometric mean** | **0.075** | **1.32** | **0.062** | **0.254** | **2.15** | **0.108** | |
 
 - With hindsight (`--trajectory final`: keyframe poses after all loop closures and the final BA) the full system's
   ATE is ~2x lower (geometric mean ~3.8 cm in the first round); live is what a robot would have had.
@@ -221,6 +234,9 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | global BA with 3 iterations instead of 10, full, 2 seeds | 0.92 [0.84, 0.99], ATE 0.91 [0.83, 0.98], rotation 1.03 [1.00, 1.07] | adopted (3x cheaper) |
 | phase-correlation prior for KLT (global image shift on pyramid level 2, `cv2.phaseCorrelate`), full, 2 seeds | final 1.04 [0.87, 1.22], rotation **0.88 [0.77, 0.99]** (14/3), lost frames 5.0 -> 3.9% | adopted |
 | trim the 20% largest residuals inside each patch-alignment iteration (robust LK), 2 seeds | full 1.10 [1.01, 1.20], VO 1.17 [1.04, 1.33] | no (9x9 patches are too small to lose 20%) |
+| window BA initialization (vs two-view 5-point at 2.5 deg), VO, 2 seeds | final 0.98 [0.88, 1.07], rotation 1.08 [1.01, 1.20] (V2_03); first 150 frames after init: position 1.00x, rotation 0.86x, initialized earlier on slow starts | adopted |
+| window init with an attempt gate of 1.5 / 2.5 deg instead of 0.5, VO, 1 seed, 8 sequences | 1.16 / 1.01 vs two-view (noise) | 0.5 |
+| intermediate keyframes taken over from the init window | never triggers (init happens before 2x the keyframe parallax) | removed |
 | our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
 
 Where the error comes from: rotation error at the end is 90-100% *systematic* (the same for all start frames) on
@@ -235,7 +251,9 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
 
 ## Next
 
-- initialization (DfUSMC / Instant VO-style small-motion init): the start of the trajectory dominates `drift`;
+- initialization beyond the window BA: the depth-integrated (marginal) likelihood of slamfold instead of MAP depths,
+  a trailing window that re-references when the first frame's tracks die (V1_01's rotation-heavy start), small-motion
+  (DfUSMC-style) depth for the very first frames;
 - cheaper global BA: it is 1-4 s for 300-600 keyframes (the LM loop in Python competes for the GIL with tracking;
   move the whole LM into numba, fewer iterations, or only the loop's region) - the remaining latency spikes;
 - the chaos is mostly the random walk of the drift itself (max / min over start frames of a random walk's endpoint
