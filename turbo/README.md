@@ -49,10 +49,20 @@ predicted (fast rotations). RANSAC PnP (poselib)
 with Huber refinement. Candidate tracks far from the epipolar line of their first observation are dropped. If fewer
 than 50 map points are tracked: *relocalization by projection* (local map, wide window). If tracking is lost (fast
 rotation + motion blur, e.g. V2_03): several pose hypotheses, DSO-style: the last good pose rotated by +-15 / 30 deg,
-then, round-robin, all keyframe poses (nearest first), each searched with its own points. While lost, a separate
-KLT tracker (`lost_rotation`, the map is not touched) keeps the orientation: rotation-only w.r.t. a reference that
-moves on with new corners, accepted when half of its tracks fit within 3 px; this pose (position held) is reported
-and is the first relocalization hypothesis.
+then, round-robin, all keyframe poses (nearest first), each searched with its own points.
+
+**Lost = initializing with a map** (`mapless`). When PnP and relocalization fail, the system does what it does before
+the first initialization (see Initialization), anchored at the last keyframe (known pose): rotation-only poses,
+keyframes with new corners, the translation test on the window since the anchor (a rolling window since the last
+keyframe is always kept), the window BA's pose once translation is established; relocalization is still tried every
+frame (back on the map: the attempt is dropped). When the test passes, the map continues from the anchor: map
+points keep their positions, the new points are triangulated, and the scale comes from the anchor's map points next
+to the new points in its image (within 10 px: depth is locally smooth). With fewer than 10 of those the scale is not
+observable and the new part is *provisional* (scale from the depth seen before): every keyframe then searches the
+old map with old keyframe poses as hypotheses (round-robin, like relocalization - the current pose may be far off),
+and when found the part gets the old map's scale and pose (the loop closure's pose graph; without loop closing a
+Sim3 of the whole part). Regimes are decided intrinsically: PnP failure, the likelihood ratio, the number of scale
+points.
 
 **Initialization** (`try_initialize_window`; the design follows `../../slamfold/DESIGN.md`). Until translation is
 established the system tracks like a rotation-only one: every frame gets the *rotation-only* pose (robust Wahba on
@@ -143,18 +153,18 @@ so with 5 starts x 17 sequences effects below ~15% are not resolvable.
 seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
 [m], *rot* = rotation drift [deg], *ATE* = whole-trajectory alignment [m]. *full* = the default system, *VO* =
 `loop=False final_ba_iters=0` (no loop closing). One config for all 22 sequences; only the camera calibration comes
-from the dataset. (`runs/m_lr_seed*`, `runs/m_lr_vo_seed*`; the TUM fr1 sequences were added here, so the geometric
+from the dataset. (`runs/n_ml_seed*`, `runs/n_ml_vo_seed*`; the TUM fr1 sequences were added here, so the geometric
 means are not comparable with the 17-sequence ones in the experiment log). *lost* = tracking losses (mean over the runs;
-the system's own flag: while lost it reports rotation-only poses, see Tracking). Poses
+the system's own flag: frames without map tracking, see "Lost = initializing with a map"). Poses
 are emitted from the first frame; the initial section for the alignment starts where the estimate first moves (before
 translation is established positions are held, see Initialization).
 
 | sequence | final (full) | rot (full) | ATE (full) | final (VO) | rot (VO) | ATE (VO) | lost: episodes / frames |
 |---|---|---|---|---|---|---|---|
-| fr1/360 | 0.485 | 24.00 | 0.209 | 0.485 | 24.00 | 0.209 | 1.0 / 97.7% |
-| fr1/desk2 | 0.743 | 29.09 | 0.925 | 0.743 | 29.09 | 0.925 | 1.0 / 92.6% |
-| fr1/room | 0.206 | 2.91 | 0.366 | 0.189 | 3.79 | 0.376 | 1.0 / 17.1% |
-| fr1/rpy | 0.068 | 2.31 | 0.037 | 0.068 | 2.31 | 0.037 | 3.5 / 22.8% |
+| fr1/360 | 1.454 | 26.05 | 0.184 | 1.454 | 27.80 | 0.184 | 9.5 / 10.9% |
+| fr1/desk2 | 0.269 | 4.10 | 0.083 | 0.269 | 7.07 | 0.108 | 2.0 / 2.1% |
+| fr1/room | 0.195 | 2.63 | 0.354 | 0.206 | 3.69 | 0.392 | 2.0 / 1.0% |
+| fr1/rpy | 0.082 | 5.05 | 0.040 | 0.082 | 7.03 | 0.040 | 5.0 / 4.6% |
 | fr1/xyz | 0.018 | 0.92 | 0.011 | 0.014 | 0.92 | 0.011 | 0.0 / 0.0% |
 | fr2/desk | 0.009 | 1.21 | 0.013 | 0.025 | 1.42 | 0.014 | 0.0 / 0.0% |
 | fr3/long_office_household | 0.011 | 0.77 | 0.034 | 0.152 | 2.46 | 0.051 | 0.0 / 0.0% |
@@ -168,12 +178,12 @@ translation is established positions are held, see Initialization).
 | V1_03_difficult | 0.059 | 0.77 | 0.035 | 0.166 | 6.41 | 0.075 | 0.0 / 0.0% |
 | V2_01_easy | 0.011 | 0.34 | 0.036 | 0.244 | 1.14 | 0.066 | 0.0 / 0.0% |
 | V2_02_medium | 0.063 | 2.02 | 0.037 | 0.220 | 3.85 | 0.077 | 0.0 / 0.0% |
-| V2_03_difficult | 0.316 | 2.04 | 0.616 | 0.463 | 4.71 | 0.621 | 2.0 / 8.3% |
-| abandonedfactory P001 | 0.435 | 2.61 | 0.081 | 0.435 | 2.61 | 0.081 | 1.0 / 0.9% |
+| V2_03_difficult | 0.352 | 2.16 | 0.686 | 0.451 | 2.04 | 0.792 | 6.0 / 3.0% |
+| abandonedfactory P001 | 0.435 | 10.49 | 0.081 | 0.435 | 10.49 | 0.081 | 1.0 / 0.9% |
 | carwelding P007 | 0.304 | 0.53 | 0.126 | 0.530 | 0.67 | 0.150 | 0.0 / 0.0% |
-| seasidetown P003 | 10.097 | 101.36 | 3.094 | 10.097 | 101.36 | 3.094 | 1.0 / 55.4% |
+| seasidetown P003 | 5.415 | 26.16 | 1.868 | 5.415 | 26.16 | 1.868 | 1.0 / 3.1% |
 | seasonsforest P002 | 0.479 | 0.25 | 0.081 | 0.479 | 0.25 | 0.081 | 0.0 / 0.0% |
-| **geometric mean** | **0.093** | **1.79** | **0.073** | **0.229** | **2.74** | **0.113** | |
+| **geometric mean** | **0.091** | **1.70** | **0.064** | **0.226** | **2.62** | **0.101** | |
 
 - With hindsight (`--trajectory final`: keyframe poses after all loop closures and the final BA) the full system's
   ATE is ~2x lower (geometric mean ~3.8 cm in the first round); live is what a robot would have had.
@@ -260,6 +270,7 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | KLT forward-backward threshold relative to the frame (max(0.5 px, 3x the median forward-backward error)), 22 sequences, 2 seeds | desk2 fully tracked in 3/10 runs instead of 1/10 (a single run had suggested a fix), seasonsforest breaks (80% lost: in low texture everything is ambiguous); final 1.19 [0.93, 1.78] | no |
 | when lost: a new map part from the rotation-only pose with the tracks continued (instead of waiting to relocalize) | 360 tracked 5 -> 95%, but the new part's scale is off (median-depth guess, 0.3-0.6x) and it stops relocalizing against the old map: room 0.09 -> 1.1 m, V2_03 0.18 -> 1.35 m | not kept (see Next) |
 | when lost: rotation-only poses from tracks of their own (map untouched; validity: half the tracks within 3 px), also the first relocalization hypothesis, 22 sequences, 2 seeds | rotation 0.92 [0.79, 1.01] (360 72 -> 24 deg, rpy 6.0 -> 2.3, desk2 25 -> 29), final 0.98 [0.96, 1.00]; sequences that never lose track unchanged; without the validity check abandonedfactory's dark last frames give 10.8 deg instead of 2.6 | adopted |
+| lost = initializing with a map (anchor = last keyframe; continue / provisional part merged by Sim3 when the old map is found), instead of the rotation tracker + relocalization, 22 sequences, 2 seeds | lost frames 13.4 -> 1.2%; full final 0.99 [0.85, 1.15], ATE 0.88 [0.69, 1.01], rotation 0.95; desk2 0.74 -> 0.27 m (29 -> 4 deg), seasidetown 10.1 -> 5.4 m; 360 0.49 -> 1.45 m, rpy rotation 2.3 -> 5.1 deg; room / V2_03 about the same (merged after 100s of frames, provisional scale off by up to 10x) | adopted |
 | live pose from the window BA once the translation test passes (until the map conditions do), 22 sequences, 2 seeds | pre-init rotation error 1.06 -> 0.42 deg (median of the max per run), jump at initialization 1.00 -> 0.17 deg; downstream full final 1.04 [0.96, 1.14], rotation 0.96 [0.89, 1.04], VO final 1.03 [0.96, 1.11] | adopted |
 | V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |
 | evaluation: initial-section alignment from the hindsight poses (applied to the live ones; `evaluate(align_est=)`) | VO: no change (final 0.254 vs 0.254); full: final 0.067 vs 0.075 but start spread 3.8 vs 2.7, drift worse (pose graphs move the early keyframes, so the two are in different frames) | kept live |
@@ -277,11 +288,11 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
 
 ## Next
 
-- fr1 / fast motion: the KLT forward-backward check (0.5 px) drops ~60% of the new corners per frame under blur
-  (desk2), but a threshold relative to the frame breaks texture-poor scenes. 360 / desk2 lose a tiny map (~10
-  keyframes) and spin into unmapped space, where relocalization has nothing to find: the map has to grow while
-  lost - a provisional part from the rotation-tracked pose that keeps relocalizing against the old map and is
-  merged by Sim3 when it does (its scale and origin are only guesses until then);
+- lost / mapless: 360 and rpy got worse with it (many short resumes with a guessed scale on a few-frame baseline);
+  the anchor is the weakest keyframe (made because map points ran out), so the scale is rarely observable - an
+  anchor further back with more map points, or the old points as fixed points in the window BA; the KLT
+  forward-backward check (0.5 px) drops ~60% of the new corners per frame under blur (desk2), but a threshold relative
+  to the frame breaks texture-poor scenes; dark scenes (abandonedfactory's end) need their own mode;
 - initialization beyond the window BA: the depth-integrated (marginal) likelihood of slamfold instead of MAP depths,
   small-motion (DfUSMC-style) depth for the very first frames;
 - cheaper global BA: it is 1-4 s for 300-600 keyframes (the LM loop in Python competes for the GIL with tracking;

@@ -68,7 +68,10 @@ class Config:
   local_map_radius = 3.0            # px
   reloc_min_3d = 50                 # relocalize (search the map with a wide window) below this many 3D tracks
   reloc_keyframes = 8               # keyframe poses tried per frame while lost
-  lost_rotation = True              # while lost: rotation-only poses from tracks of its own (live output + relocalization)
+  mapless = True                    # lost: track on like before the first initialization (rotation-only / window BA poses)
+                                    # from the last keyframe, until a new part of the map is made or relocalization works
+  resume_scale_points = 10          # map points next to the new ones that make the scale of a new part observable; with
+                                    # fewer it is provisional (scale guessed) until the old map is found again
   reinit = False                    # start a new map segment when relocalization keeps failing
   reinit_after = 10                 # frames lost before that
 
@@ -157,7 +160,8 @@ class SLAM:
     self.pre_kfs = []                 # keyframes made before translation was established (rotation-only poses)
     self.anchor = -1                  # the one the translation test is relative to
     self.window_pose = None           # T_cw of the current frame from the window BA (translation established)
-    self.rt = None                    # while lost: rotation tracker [reference pose, reference pixels, pixels, count, pose]
+    self.provisional = None           # a map part of unknown scale since a junction keyframe: (junction, first keyframe,
+                                      # mask of the points mapped before)
     self.init_n_tracks = 0            # tracks right after the last of them
     self.lost = 0                     # frames since tracking was lost
     self.kf_n3d = 0                   # tracked map points right after the last keyframe
@@ -338,7 +342,6 @@ class SLAM:
   # ------------------------------------------------------------------------------------------------- initialization
 
   def try_initialize(self):
-    self.window.append((self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64)))
     if self.c.init_mode == 'window':
       return self.try_initialize_window()
     return self.try_initialize_twoview()
@@ -454,7 +457,17 @@ class SLAM:
     good = ~bad & (X[:, 2] > 0)
     good_angle = good & (angle >= np.deg2rad(c.tri_min_angle))
     self.diag['init_ratio'] = dF / extra
-    s = self.good_depth / np.median(X[good, 2])
+    # scale: the depths of the anchor's map points next to the new points in its image (the same point, or a
+    # neighbour within 10 px: depth is locally smooth), else the depth seen before
+    s, n_scale = self.good_depth / np.median(X[good, 2]), 0
+    o = m.obs_of(kfs=[kf0])
+    o = o[m.pts.state[m.obs.pt[o]] == MAPPED]
+    if len(o) >= 5:
+      d, i = scipy.spatial.cKDTree(m.obs.uv[o]).query(ref[inl][good])
+      close = d < 10
+      if close.sum() >= 5:
+        depth_old = transform(m.kfs.T[kf0], m.pts.X[m.obs.pt[o[i[close]]]])[:, 2]
+        s, n_scale = float(np.median(depth_old / X[good][close, 2])), int(close.sum())
     T[:, :3, 3] *= s
     X = X * s
     T0 = m.kfs.T[kf0]
@@ -468,10 +481,14 @@ class SLAM:
     keep = np.zeros(len(m.pts), bool)
     keep[pts[good]] = True
     self.keep_tracks(keep[self.tr_pt])
-    m.kill(np.setdiff1d(m.points_of(kf0, CANDIDATE), self.tr_pt))
+    if not self.initialized:
+      m.kill(np.setdiff1d(m.points_of(kf0, CANDIDATE), self.tr_pt))
     kf1 = self.add_keyframe(self.T_cw)
-    good_pts = pts[good_angle]
-    m.pts.X[good_pts] = transform(inv_pose(T0), X[good_angle])
+    new = good_angle & (m.pts.state[pts] == CANDIDATE)     # (map points keep their positions)
+    good_pts = pts[new]
+    new_mask = m.pts.state != MAPPED
+    new_mask[good_pts] = True
+    m.pts.X[good_pts] = transform(inv_pose(T0), X[new])
     m.pts.state[good_pts] = MAPPED
     # hindsight: the frames since the anchor get poses from the window solution (refined on its points)
     Xw = X[good_angle]
@@ -486,14 +503,17 @@ class SLAM:
       i = np.flatnonzero(self.traj.frame == f)
       if len(i):
         self.traj.T[i] = T_f @ T0 @ inv_pose(m.kfs.T[self.traj.ref[i]])
-    self.window = []
     self.drop_pre_keyframes(kf0, kf1)
+    resumed = self.initialized
+    if resumed and n_scale < c.resume_scale_points and self.provisional is None:
+      self.provisional = (kf0, kf1, ~new_mask)
     self.initialized, self.initializing, self.lost = True, False, 0
     self.local_ba(kf1)
     self.detect(kf1)
     self.kf_n3d = int(self.mapped_tracks().sum())
-    self.events.append({'type': 'init', 'frame': self.frame, 'segment': self.segment, 'points': int(len(good_pts)),
-                        'frames': len(frames), 'ratio': dF / extra})
+    self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
+    self.events.append({'type': 'init' if not resumed else 'resume', 'frame': self.frame, 'segment': self.segment,
+                        'points': int(len(good_pts)), 'frames': len(frames), 'ratio': dF / extra, 'scale_from': n_scale})
 
   def try_initialize_twoview(self):
     '''
@@ -562,6 +582,19 @@ class SLAM:
     self.init_n_tracks = len(self.tr_pt)
     self.events.append({'type': 'pre_keyframe', 'frame': self.frame})
 
+  def start_mapless(self):
+    '''
+    tracking is lost: from here on the same as before the first initialization, with the last keyframe (known pose) as
+    the anchor - rotation-only poses, keyframes with new corners, the translation test on the window since the anchor;
+    a successful one continues the map (scale from the map points among the tracks), relocalization ends it
+    '''
+    self.initializing = True
+    self.anchor, self.pre_kfs, self.init_n_tracks = self.last_kf, [], len(self.tr_pt)
+    self.window = [w for w in self.window if w[0] >= self.map.kfs.frame[self.anchor]]
+    if (T := self.rotation_only_pose()) is not None:
+      self.T_cw = T
+    self.events.append({'type': 'mapless', 'frame': self.frame})
+
   def init_anchor(self):
     '''
     the keyframe the translation test is relative to (the window starts there): the first pre-translation keyframe
@@ -595,48 +628,10 @@ class SLAM:
         m.remove_obs(m.obs_of(kfs=[k]))
         m.kfs.alive[k] = False
         m.images.release(m.kfs.slot[k])
-    m.kfs.parent[kf0] = m.kfs.parent[self.pre_kfs[0]]
+    if kf0 in self.pre_kfs:
+      m.kfs.parent[kf0] = m.kfs.parent[self.pre_kfs[0]]
     m.kfs.parent[kf1] = kf0
     self.pre_kfs = []
-
-  def lost_rotation(self, img):
-    '''
-    while lost: orientation from KLT tracks of its own (the map is not touched), relative to a reference that moves on
-    (with new corners) when fewer than 70% of the tracks survive; the position is held at the last good one. A frame
-    whose tracks do not fit a rotation (fewer than half within pnp_px) keeps the last orientation and starts over with
-    new corners. Returns the pose or None
-    '''
-    c = self.c
-    if self.rt is None:      # just lost: start from the map tracks, relative to the last keyframe
-      has = np.isfinite(self.tr_kf_uv).all(axis=1)
-      T_ref = make_pose(self.map.kfs.T[self.last_kf][:3, :3], np.zeros(3))
-      T_ref[:3, 3] = -T_ref[:3, :3] @ camera_center(self.T_good)
-      self.rt = [T_ref, self.tr_kf_uv[has], self.tr_uv[has].astype(np.float32), int(has.sum()), None]
-    else:
-      T_ref, uv_ref, uv, n0, T_last = self.rt
-      guess = uv + self.shift if getattr(self, 'shift', None) is not None else None
-      uv, ok = self.klt(self.img, img, uv, guess)
-      self.rt = [T_ref, uv_ref[ok], uv[ok], n0, T_last]
-    T_ref, uv_ref, uv, n0, T_last = self.rt
-    T = None
-    if len(uv) >= c.pnp_min_inliers:
-      R, res = self.rotation_only(uv_ref, uv.astype(np.float64))
-      inl = res <= c.pnp_px
-      if inl.sum() >= max(c.pnp_min_inliers, 0.5 * len(uv)):
-        T = make_pose(R, np.zeros(3)) @ T_ref
-        uv_ref, uv = uv_ref[inl], uv[inl]
-    if T is None:       # no rotation fits: keep the last orientation, new corners from here
-      T = T_last
-      if T is None:
-        self.rt = None
-        return None
-      uv = np.zeros((0, 2), np.float32)
-      n0 = 0
-    self.rt = [T_ref, uv_ref, uv, n0, T]
-    if len(uv) < max(c.init_min_points, c.kf_tracked_ratio * n0):    # new reference, new corners
-      uv = np.r_[uv, self.corners(img, uv)].astype(np.float32)
-      self.rt = [T, uv.astype(np.float64), uv, len(uv), T]
-    return T
 
   def rotation_only_pose(self):
     '''the current pose if the camera only rotated since the last keyframe (None: too few tracks)'''
@@ -1163,6 +1158,9 @@ class SLAM:
           self.detect_loop(kf, untracked[old])
         else:
           self.detect_segment_loop(kf)
+    if self.provisional is not None:
+      with self.timed('loop'):
+        self.refind_old_map(kf)
     if c.cull_points:
       self.cull_points(kf)
     if c.cull_keyframes:
@@ -1171,6 +1169,7 @@ class SLAM:
     with self.timed('detect'):
       self.detect(kf)
     self.kf_n3d = int(self.mapped_tracks().sum())
+    self.window = [(self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64))]
 
   # ------------------------------------------------------------------------------------------------- loops
 
@@ -1211,6 +1210,76 @@ class SLAM:
       if inl.sum() >= 2 * c.loop_min_inliers:
         self.close_loop(kf, T_loop, pts[inl], uv[inl], np.inf)
         return
+
+  def refind_old_map(self, kf):
+    '''
+    a provisional map part (scale unknown): look for the map before it with the poses of its keyframes as hypotheses
+    (round-robin, like relocalization); found, the part gets the old map's scale and pose - by the pose graph of a loop
+    closure (or a Sim3 of the whole part without loop closing)
+    '''
+    c, m = self.c, self.map
+    junction, first, old_pts = self.provisional
+    old_kfs = np.flatnonzero(m.kfs.alive[:first])
+    self.segment_cursor += c.reloc_keyframes
+    for k in old_kfs[(self.segment_cursor + np.arange(c.reloc_keyframes)) % len(old_kfs)]:
+      cand = m.points_of(k)
+      cand = cand[cand < len(old_pts)]
+      cand = cand[old_pts[cand]]
+      pts, uv = self.search(m.kfs.T[k], self.pyr, cand, 3, 8, np.inf)
+      if len(pts) < 2 * c.loop_min_matches:
+        continue
+      T_old, inl = self.pnp(uv, m.pts.X[pts], m.kfs.T[k])
+      if inl.sum() < 2 * c.loop_min_inliers:
+        continue
+      pts, uv = pts[inl], uv[inl]
+      if c.loop:
+        self.close_loop(kf, T_old, pts, uv, np.inf)
+      else:
+        self.merge_provisional(kf, T_old, pts, uv)
+      return
+
+  def loop_scale(self, kf, T_loop, pts, uv):
+    '''scale drift at a loop: depth of the old points (loop pose) vs nearby current points (current pose), or None'''
+    m = self.map
+    cur = m.points_of(kf)
+    o = m.obs_of(kfs=[kf], pts=cur)
+    if len(o) == 0:
+      return None
+    cur_uv, cur_depth = m.obs.uv[o], transform(m.kfs.T[kf], m.pts.X[m.obs.pt[o]])[:, 2]
+    old_depth = transform(T_loop, m.pts.X[pts])[:, 2]
+    d, i = scipy.spatial.cKDTree(cur_uv).query(uv)
+    close = d < 10
+    return float(np.median(old_depth[close] / cur_depth[i[close]])) if close.sum() >= 5 else None
+
+  def merge_provisional(self, kf, T_old, pts, uv):
+    '''the provisional part (keyframes from its first one, the points mapped since) by the Sim3 that puts kf at T_old'''
+    m = self.map
+    junction, first, old_pts = self.provisional
+    s = self.loop_scale(kf, T_old, pts, uv)
+    if s is None:
+      return
+    R_S = T_old[:3, :3].T @ m.kfs.T[kf][:3, :3]
+    t_S = camera_center(T_old) - s * R_S @ camera_center(m.kfs.T[kf])
+    def move(T):      # T_cw in the provisional frame -> in the old one
+      T = T.copy()
+      T[..., :3, 3] = s * T[..., :3, 3] - (T[..., :3, :3] @ R_S.T) @ t_S
+      T[..., :3, :3] = T[..., :3, :3] @ R_S.T
+      return T
+    part = np.flatnonzero(m.kfs.alive)
+    part = part[part >= first]
+    m.kfs.T[part] = move(m.kfs.T[part])
+    p = np.flatnonzero(m.pts.state == MAPPED)
+    p = p[(p >= len(old_pts)) | ~old_pts[np.minimum(p, len(old_pts) - 1)]]
+    m.pts.X[p] = s * m.pts.X[p] @ R_S.T + t_S
+    i = np.flatnonzero(self.traj.ref >= first)
+    self.traj.T[i, :3, 3] *= s
+    self.T_cw = self.T_good = move(self.T_cw)
+    self.velocity = np.eye(4)
+    self.good_depth *= s
+    self.provisional = None
+    self.events.append({'type': 'merge', 'frame': self.frame, 'kf': int(kf), 'scale': s, 'matches': int(len(pts))})
+    self.fuse(kf, pts, uv)
+    self.local_ba(kf)
 
   def close_loop(self, kf, T_loop, pts, uv, disagreement):
     c, m = self.c, self.map
@@ -1266,6 +1335,8 @@ class SLAM:
       m.kfs.segment[m.kfs.segment == m.kfs.segment[kf]] = m.kfs.segment[src]
       self.segment = int(m.kfs.segment[src])
     self.diag['loop_closed'] = True
+    if self.provisional is not None and src < self.provisional[1]:   # (the provisional part is in the old map now)
+      self.provisional = None
     self.events.append({'type': 'loop', 'frame': self.frame, 'kf': int(kf), 'loop_kf': int(src),
                         'matches': int(len(pts)), 'scale': s, 'disagreement': disagreement, 'moved': float(moved)})
     # 3. re-find the old points with the corrected pose, fuse, global BA
@@ -1303,19 +1374,19 @@ class SLAM:
       T_pred = self.predict(T_prev)
       with self.timed('klt'):
         self.track(img, T_pred, pyr)
-        T_rot = self.lost_rotation(img) if self.rt is not None and c.lost_rotation else None
       self.img, self.pyr = img, pyr
+      self.window.append((self.frame, self.tr_pt.copy(), self.tr_uv.astype(np.float64)))
       if self.initializing:
         with self.timed('init'):
-          if self.initialized and self.relocalize(self.T_good):    # back on the map: no new segment needed
+          if self.initialized and self.relocalize(self.T_cw):    # back on the map: no new segment needed
             self.abort_segment()
             self.lost, self.T_good = 0, self.T_cw.copy()
           else:
             self.lost += self.initialized
             self.window_pose = None
             self.try_initialize()
-            if self.initializing and not self.initialized:
-              # not initialized yet: the window BA's pose once translation is established, before that the
+            if self.initializing:
+              # not initialized yet (or lost): the window BA's pose once translation is established, before that the
               # rotation-only one (position held)
               if self.window_pose is not None:
                 self.T_cw = self.window_pose
@@ -1329,7 +1400,7 @@ class SLAM:
           ok = self.estimate_pose(T_pred)
         if not ok or self.mapped_tracks().sum() < c.reloc_min_3d:
           with self.timed('relocalize'):
-            ok = self.relocalize(self.T_cw if ok else (T_rot if T_rot is not None else T_pred)) or ok
+            ok = self.relocalize(self.T_cw if ok else T_pred) or ok
         if ok and c.track_local_map:
           with self.timed('local_map'):
             self.track_local_map()
@@ -1338,7 +1409,6 @@ class SLAM:
           self.acceleration = velocity @ inv_pose(self.velocity)
           self.velocity = velocity
           self.lost = 0
-          self.rt = None
           self.T_good = self.T_cw.copy()
           m3 = self.mapped_tracks()
           self.good_depth = float(np.median(transform(self.T_cw, self.map.pts.X[self.tr_pt[m3]])[:, 2]))
@@ -1347,12 +1417,8 @@ class SLAM:
           self.T_cw = T_pred if self.lost <= 3 else self.T_good
           if self.lost > 3:
             self.velocity = np.eye(4)
-          if c.lost_rotation:
-            if self.rt is None:
-              T_rot = self.lost_rotation(img)
-            if T_rot is not None:
-              self.T_cw = T_rot
-              self.velocity = np.eye(4)
+          if c.mapless:
+            self.start_mapless()
           if c.reinit and self.lost > c.reinit_after:
             self.start_segment()
         self.epipolar_filter()
@@ -1362,7 +1428,7 @@ class SLAM:
           self.diag['keyframe'] = True
 
     m = self.map
-    if self.initialized and not self.initializing and (not self.lost or (c.lost_rotation and self.rt is not None)):
+    if self.initialized and not self.lost and not self.initializing:
       self.traj.add(1, frame=index, ref=self.last_kf, T=self.T_cw @ inv_pose(m.kfs.T[self.last_kf]),
                     online=inv_pose(self.T_cw))
     self.stats.add(1, frame=index, tracks=len(self.tr_pt), mapped=int(self.mapped_tracks().sum()),
