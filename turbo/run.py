@@ -57,6 +57,13 @@ def perturbed(seed, factor=1.4):
   return overrides
 
 
+def lost_flags(n, frames, lost):
+  '''per-frame "tracking lost" flags from the per-frame stats'''
+  flags = np.zeros(n, bool)
+  flags[frames[lost > 0]] = True
+  return flags
+
+
 def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
   cv2.setNumThreads(1)
   data = datasets.load(name)
@@ -77,8 +84,9 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
   n = stop - start
   T_final, T_online = slam.poses(n, online=False), slam.poses(n)
   gt, gt_R = data.gt[start:stop, :3, 3], data.gt[start:stop, :3, :3]
-  m_final = evaluate.evaluate(T_final[:, :3, 3], gt, est_R=T_final[:, :3, :3], gt_R=gt_R)
-  m_online = evaluate.evaluate(T_online[:, :3, 3], gt, est_R=T_online[:, :3, :3], gt_R=gt_R)
+  lost = lost_flags(n, slam.stats.frame, slam.stats.lost)
+  m_final = evaluate.evaluate(T_final[:, :3, 3], gt, est_R=T_final[:, :3, :3], gt_R=gt_R, lost=lost)
+  m_online = evaluate.evaluate(T_online[:, :3, 3], gt, est_R=T_online[:, :3, :3], gt_R=gt_R, lost=lost)
   events = {}
   for e in slam.events:
     events[e['type']] = events.get(e['type'], 0) + 1
@@ -156,7 +164,8 @@ def summary(run_dirs, metrics=('final', 'rot', 'drift', 'ate', 'lost_episodes', 
       key = 'online_poses' if trajectory == 'online' else 'poses'
       gt = [x[-len(t['final']):] for x in gts[name]]
       R = (t[key][:, :3, :3], gt[1]) if key in t else (None, None)
-      runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gt[0], est_R=R[0], gt_R=R[1])
+      lost = lost_flags(len(t['final']), t['stats_frame'], t['stats_lost']) if 'stats_lost' in t else None
+      runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gt[0], est_R=R[0], gt_R=R[1], lost=lost)
                                        | {'fps': r['fps'], 'kfs': r['keyframes']})
     for name, rs in runs.items():   # median over start frames (a failed run counts as infinitely bad)
       if all(r is None for r in rs):

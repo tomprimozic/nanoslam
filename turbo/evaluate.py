@@ -52,23 +52,28 @@ def hold(est):
   return np.where((last >= 0)[:, None], est[np.maximum(last, 0)], np.nan)
 
 
-def lost_stats(est):
-  '''tracking losses after the first tracked frame: number of episodes, fraction of frames'''
+def lost_stats(est, lost=None):
+  '''
+  tracking losses after the first tracked frame: number of episodes, fraction of frames (`lost`: per-frame flags of the
+  system, e.g. when it keeps reporting rotation-only poses while lost; default: frames without an estimate)
+  '''
   ok = np.isfinite(est).all(axis=1)
+  if lost is not None:
+    ok &= ~lost
   if not ok.any():
     return {'lost_episodes': 0, 'lost%': 100.0}
   ok = ok[np.argmax(ok):]
   return {'lost_episodes': int(np.sum(ok[:-1] & ~ok[1:])), 'lost%': float(100 * (~ok).mean())}
 
 
-def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align_est=None):
+def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align_est=None, lost=None):
   '''
   est, gt: (N, 3) camera centres (rows NaN where not tracked / no ground truth). Lost frames are scored with the last
   estimate (as a system that keeps reporting its last pose would be), so losing track is not better than tracking badly
   '''
   has_gt = np.isfinite(gt).all(axis=1)
   tracked = np.isfinite(est).all(axis=1) & has_gt
-  lost = lost_stats(est)
+  lost = lost_stats(est, lost)
   if est_R is not None:
     est_R = hold(est_R.reshape(len(est_R), 9)).reshape(-1, 3, 3)
   est = hold(est)
