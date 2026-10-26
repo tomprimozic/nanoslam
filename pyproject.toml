@@ -1,7 +1,7 @@
 [project]
 name = "nanoslam"
 version = "0.1.0"
-description = "Add your description here"
+description = "a simple and accurate monocular SLAM in Python"
 readme = "README.md"
 authors = [{ name = "Tom Primozic", email = "tom@primozic.org" }]
 requires-python = ">=3.14"
