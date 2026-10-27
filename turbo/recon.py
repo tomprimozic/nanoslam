@@ -829,7 +829,329 @@ def pm_init_costs(ref, others, K, Kinv, R, t, z, n, half, best_k):
   return cost
 
 
-ENGINES = {'sparse': sparse, 'dis': dis, 'multi': multi_baseline, 'combined': combined, 'sequential': sequential, 'refined': refined, 'patchmatch': patchmatch}
+# ------------------------------------------------------------------------------------------------- Depth from Motion
+# Google's pipeline (Valentin et al. 2018, Depth from Motion for Smartphone AR): a learned binary matching cost
+# (UltraStereo, Fanello et al. 2017), CRF inference by row-parallel PatchMatch / HashMatch passes, invalidation by
+# CRF cost and connected components, densification by the planar bilateral solver. Multi-view (best views of the
+# covisible keyframes) instead of one polar-rectified pair
+
+def train_hash(images, half=5, bits=32, nonzero=4, samples=20000, proposals=100, seed=0):
+  '''
+  UltraStereo's unsupervised binary mapping: greedy splits of a tree (breadth first, bits nodes) on image patches
+  (normalized: zero mean, unit norm; passive images instead of an active pattern), each a sparse hyperplane z
+  (nonzero taps) and threshold theta, chosen among random proposals by the information gain under a Gaussian model
+  of the patches (log-determinants of the covariances). Returns pixel offsets (bits, nonzero, 2), weights, thresholds
+  '''
+  rng = np.random.default_rng(seed)
+  W = 2 * half + 1
+  X = []
+  for img in images:
+    img = img.astype(np.float32)
+    h, w = img.shape
+    vv = rng.integers(half, h - half, samples // len(images))
+    uu = rng.integers(half, w - half, samples // len(images))
+    X.append(np.array([img[v - half:v + half + 1, u - half:u + half + 1].ravel() for v, u in zip(vv, uu)]))
+  X = np.concatenate(X)
+  X -= X.mean(1, keepdims=True)
+  X /= np.linalg.norm(X, axis=1, keepdims=True) + 1e-6
+  def logdet(Y):
+    if len(Y) <= Y.shape[1]:
+      return 0.0
+    C = np.cov(Y, rowvar=False) + 1e-6 * np.eye(Y.shape[1])
+    return np.linalg.slogdet(C)[1]
+  offsets, weights, thetas = [], [], []
+  queue = [np.arange(len(X))]
+  while len(offsets) < bits:
+    idx = queue.pop(0)
+    S = X[idx]
+    H = logdet(S)
+    best = None
+    for _ in range(proposals):
+      taps = rng.choice(W * W, nonzero, replace=False)
+      z = rng.normal(size=nonzero)
+      p = S[:, taps] @ z
+      th = np.quantile(p, rng.uniform(0.3, 0.7))
+      L = p < th
+      gain = H - (L.mean() * logdet(S[L]) + (~L).mean() * logdet(S[~L]))
+      if best is None or gain > best[0]:
+        best = (gain, taps, z, th, L)
+    _, taps, z, th, L = best
+    offsets.append(np.c_[taps // W - half, taps % W - half])
+    weights.append(z)
+    thetas.append(th)
+    queue += [idx[L], idx[~L]]
+  return np.array(offsets), np.array(weights), np.array(thetas)
+
+
+def hash_codes(img, hsh, half=5):
+  '''every pixel's 32-bit code (int64) of its normalized patch'''
+  offsets, weights, thetas = hsh
+  img = img.astype(np.float32)
+  W = 2 * half + 1
+  mu = cv2.boxFilter(img, -1, (W, W))
+  norm = np.sqrt(np.maximum(cv2.boxFilter(img * img, -1, (W, W)) * W * W - mu * mu * W * W, 1e-6))
+  pad = cv2.copyMakeBorder(img, half, half, half, half, cv2.BORDER_REFLECT)
+  h, w = img.shape
+  code = np.zeros((h, w), np.int64)
+  for b in range(len(thetas)):
+    p = np.zeros((h, w), np.float32)
+    for (dv, du), z in zip(offsets[b], weights[b]):
+      p += z * (pad[half + dv:half + dv + h, half + du:half + du + w] - mu)
+    code |= (p / norm >= thetas[b]).astype(np.int64) << b
+  return code
+
+
+@njit(cache=True, nogil=True)
+def popcount(x):
+  x = x - ((x >> 1) & 0x55555555)
+  x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+  x = (x + (x >> 4)) & 0x0F0F0F0F
+  return ((x * 0x01010101) & 0xFFFFFFFF) >> 24
+
+
+@njit(cache=True, nogil=True)
+def hash_unary(code0, codes, K, Kinv, R, t, u, v, rho, best_k):
+  '''mean Hamming distance over the best_k views of pixel (u, v) at inverse depth rho; bilinear in the target pixel'''
+  F, h, w = codes.shape
+  c0 = code0[v, u]
+  x0 = (Kinv[0, 0] * u + Kinv[0, 2]) / rho
+  x1 = (Kinv[1, 1] * v + Kinv[1, 2]) / rho
+  x2 = 1.0 / rho
+  costs = np.empty(F)
+  for f in range(F):
+    Y0 = R[f, 0, 0] * x0 + R[f, 0, 1] * x1 + R[f, 0, 2] * x2 + t[f, 0]
+    Y1 = R[f, 1, 0] * x0 + R[f, 1, 1] * x1 + R[f, 1, 2] * x2 + t[f, 1]
+    Y2 = R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2] * x2 + t[f, 2]
+    if Y2 <= 1e-9:
+      costs[f] = 32.0
+      continue
+    pu = K[0, 0] * Y0 / Y2 + K[0, 2]
+    pv = K[1, 1] * Y1 / Y2 + K[1, 2]
+    if pu < 0 or pv < 0 or pu >= w - 1 or pv >= h - 1:
+      costs[f] = 32.0
+      continue
+    iu, iv = int(pu), int(pv)
+    fu, fv = pu - iu, pv - iv
+    costs[f] = ((1 - fu) * (1 - fv) * popcount(c0 ^ codes[f, iv, iu]) + fu * (1 - fv) * popcount(c0 ^ codes[f, iv, iu + 1]) +
+                (1 - fu) * fv * popcount(c0 ^ codes[f, iv + 1, iu]) + fu * fv * popcount(c0 ^ codes[f, iv + 1, iu + 1]))
+  costs.sort()
+  return np.mean(costs[:min(best_k, F)])
+
+
+@njit(cache=True, nogil=True)
+def crf_energy(code0, codes, K, Kinv, R, t, rho, u, v, r, best_k, lam, step, trunc):
+  '''the pixel's local CRF energy for label r: unary + truncated linear pairwise to its 4 neighbours'''
+  h, w = rho.shape
+  e = hash_unary(code0, codes, K, Kinv, R, t, u, v, r, best_k)
+  for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+    y, x = v + dy, u + dx
+    if 0 <= y < h and 0 <= x < w:
+      e += lam * min(abs(r - rho[y, x]) / step, trunc)
+  return e
+
+
+@njit(cache=True, parallel=True)
+def crf_passes(code0, codes, K, Kinv, R, t, rho, lo, hi, best_k, lam, step, trunc, passes, seed):
+  '''
+  DfM's hybrid PatchMatch / HashMatch inference: even passes go down the rows, each pixel trying the labels of the
+  three pixels above it, odd passes go up (the three below); pixels of a row are independent (parallel). Plus a
+  random perturbation per pixel (shrinking with the pass)
+  '''
+  h, w = rho.shape
+  for p in range(passes):
+    down = p % 2 == 0
+    spread = (hi - lo) * 0.1 * 0.5 ** p
+    for i in range(h):
+      v = i if down else h - 1 - i
+      dy = -1 if down else 1
+      for u in prange(w):
+        np.random.seed(seed + p * 1000003 + v * 1009 + u)
+        best_r = rho[v, u]
+        best_e = crf_energy(code0, codes, K, Kinv, R, t, rho, u, v, best_r, best_k, lam, step, trunc)
+        y = v + dy
+        for dx in (-1, 0, 1):
+          x = u + dx
+          if 0 <= y < h and 0 <= x < w:
+            r = rho[y, x]
+            e = crf_energy(code0, codes, K, Kinv, R, t, rho, u, v, r, best_k, lam, step, trunc)
+            if e < best_e:
+              best_e, best_r = e, r
+        r = min(max(best_r + np.random.normal() * spread, lo), hi)
+        e = crf_energy(code0, codes, K, Kinv, R, t, rho, u, v, r, best_k, lam, step, trunc)
+        if e < best_e:
+          best_e, best_r = e, r
+        rho[v, u] = best_r
+
+
+@njit(cache=True, parallel=True)
+def crf_init(code0, codes, K, Kinv, R, t, lo, hi, best_k, particles, seed):
+  '''the best of a few random inverse depths per pixel (unary only)'''
+  h, w = code0.shape
+  rho = np.empty((h, w))
+  for v in prange(h):
+    np.random.seed(seed + v)
+    for u in range(w):
+      best_e, best_r = 1e9, lo
+      for _ in range(particles):
+        r = lo + np.random.random() * (hi - lo)
+        e = hash_unary(code0, codes, K, Kinv, R, t, u, v, r, best_k)
+        if e < best_e:
+          best_e, best_r = e, r
+      rho[v, u] = best_r
+  return rho
+
+
+@njit(cache=True, parallel=True)
+def crf_costs(code0, codes, K, Kinv, R, t, rho, best_k, lam, step, trunc):
+  h, w = rho.shape
+  L = np.empty((h, w))
+  for v in prange(h):
+    for u in range(w):
+      L[v, u] = crf_energy(code0, codes, K, Kinv, R, t, rho, u, v, rho[v, u], best_k, lam, step, trunc)
+  return L
+
+
+class BilateralGrid:
+  '''
+  the bilateral grid of a reference image (Barron & Poole 2016): trilinear splat / slice S, the [1, 2, 1] blur B,
+  bistochastization (m, n); solve() is the bilateral solver
+  '''
+
+  def __init__(self, ref, sigma_xy=16.0, sigma_r=16.0):
+    import scipy.sparse as sp
+    h, w = ref.shape
+    vv, uu = np.mgrid[0:h, 0:w]
+    g = np.stack([vv.ravel() / sigma_xy, uu.ravel() / sigma_xy, ref.ravel().astype(np.float64) / sigma_r], 1)
+    base = np.floor(g).astype(np.int64)
+    frac = g - base
+    dims = base.max(0) + 2
+    rows, cols, vals = [], [], []
+    N = h * w
+    for corner in range(8):
+      o = np.array([(corner >> 2) & 1, (corner >> 1) & 1, corner & 1])
+      idx = ((base[:, 0] + o[0]) * dims[1] + base[:, 1] + o[1]) * dims[2] + base[:, 2] + o[2]
+      wt = np.prod(np.where(o, frac, 1 - frac), axis=1)
+      rows.append(idx)
+      cols.append(np.arange(N))
+      vals.append(wt)
+    rows, cols, vals = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    nz = vals > 1e-9
+    rows, cols, vals = rows[nz], cols[nz], vals[nz]
+    used, rows = np.unique(rows, return_inverse=True)
+    V = len(used)
+    self.S = sp.csr_matrix((vals, (rows, cols)), shape=(V, N))
+    # blur: neighbours along each grid axis (among the used vertices)
+    lookup = {int(k): i for i, k in enumerate(used)}
+    strides = [dims[1] * dims[2], dims[2], 1]
+    br, bc = [], []
+    for s in strides:
+      for i, k in enumerate(used):
+        j = lookup.get(int(k) + s)
+        if j is not None:
+          br += [i, j]
+          bc += [j, i]
+    self.B = sp.csr_matrix((np.ones(len(br)), (br, bc)), shape=(V, V)) + 6 * sp.eye(V)
+    m = np.asarray(self.S.sum(1)).ravel()
+    n = np.ones(V)
+    for _ in range(20):
+      n = np.sqrt(n * m / (self.B @ n))
+    self.m, self.n, self.shape = m, n, (h, w)
+
+  def solver(self, c, lam=4.0):
+    '''the bilateral solver for confidence c (a linear filter): returns t -> argmin of eq. 7 of DfM'''
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    Sc = self.S @ c.ravel()
+    A = lam * (sp.diags(self.m) - sp.diags(self.n) @ self.B @ sp.diags(self.n)) + sp.diags(Sc) + 1e-9 * sp.eye(len(Sc))
+    lu = spla.splu(A.tocsc())
+    def f(tgt):
+      return (self.S.T @ lu.solve(self.S @ (c * tgt).ravel())).reshape(self.shape)
+    return f
+
+
+def planar_filter(Z, filt, eps=1e-3, scale=16.0):
+  '''
+  DfM's planar filter (Algorithm 1): a plane per pixel fitted by moving least squares, the weights given by a linear
+  filter (the bilateral solver); returns the plane's value at the pixel. On inverse depth, planes are exact
+  '''
+  h, w = Z.shape
+  vv, uu = np.mgrid[0:h, 0:w]
+  x, y = uu / scale, vv / scale
+  Z0 = np.nan_to_num(Z)
+  F1, Fx, Fy, Fz, Fxx, Fxy, Fxz, Fyy, Fyz = (filt(a) for a in (np.ones_like(Z0), x, y, Z0, x * x, x * y, x * Z0, y * y, y * Z0))
+  A = np.empty((h, w, 3, 3))
+  A[..., 0, 0] = F1 * y * y - 2 * y * Fy + Fyy + eps ** 2
+  A[..., 0, 1] = A[..., 1, 0] = F1 * y * x - x * Fy - y * Fx + Fxy
+  A[..., 1, 1] = F1 * x * x - 2 * x * Fx + Fxx + eps ** 2
+  A[..., 0, 2] = A[..., 2, 0] = F1 * y - Fy
+  A[..., 1, 2] = A[..., 2, 1] = F1 * x - Fx
+  A[..., 2, 2] = F1
+  b = np.stack([Fz * y - Fyz, Fz * x - Fxz, Fz], -1)
+  # (unknowns (Zy, Zx, Zz) of Z_j ~ Zz + Zy (y - y_j) + Zx (x - x_j); no Tikhonov term on the offset Zz)
+  sol = np.linalg.solve(A.reshape(-1, 3, 3), b.reshape(-1, 3, 1)).reshape(h, w, 3)
+  return sol[..., 2], F1
+
+
+def google(rc, k, views=6, best_k=3, particles=5, passes=4, lam=1.0, levels=64, trunc=4.0, scale=2, max_cost=None,
+           speckle=0.002, densify=True, sigma_xy=16.0, sigma_r=16.0, solver_lam=4.0):
+  '''
+  Depth from Motion on keyframe k: hashed patches matched at half resolution by the CRF passes, invalidated by the
+  local CRF cost (default: the median plus a margin) and small connected components, then densified at full
+  resolution by the planar bilateral solver (confidence 1 at the valid pixels)
+  '''
+  img = rc.image(k)
+  H, W = img.shape
+  nbrs = rc.covisible(k, views)
+  if len(nbrs) == 0:
+    return np.full((H, W), np.nan), np.full((H, W), np.nan)
+  if getattr(rc, 'hash', None) is None:
+    rc.hash = train_hash([rc.image(j) for j in range(0, len(rc), max(1, len(rc) // 20))])
+  h, w = H // scale, W // scale
+  small = lambda im: cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA)
+  code0 = hash_codes(small(img), rc.hash)
+  codes = np.array([hash_codes(small(rc.image(j)), rc.hash) for j in nbrs])
+  Ks = rc.K.copy()
+  Ks[:2] /= scale
+  Ks[:2, 2] = (rc.K[:2, 2] + 0.5) / scale - 0.5
+  Kinv = np.linalg.inv(Ks)
+  rel = np.array([rc.T[j] @ np.linalg.inv(rc.T[k]) for j in nbrs])
+  R, t = rel[:, :3, :3].copy(), rel[:, :3, 3].copy()
+  lo, hi = sparse_range(rc, k)
+  step = (hi - lo) / levels
+  rho = crf_init(code0, codes, Ks, Kinv, R, t, lo, hi, best_k, particles, k)
+  crf_passes(code0, codes, Ks, Kinv, R, t, rho, lo, hi, best_k, lam, step, trunc, passes, 7919 * k)
+  L = crf_costs(code0, codes, Ks, Kinv, R, t, rho, best_k, lam, step, trunc)
+  thr = np.median(L) if max_cost is None else max_cost
+  ok = L < thr
+  q = np.where(ok, np.round((rho - lo) / step * 4), -1).astype(np.int16)        # (quarter levels)
+  cv2.filterSpeckles(q, -1, int(speckle * h * w), 4)
+  ok &= q >= 0
+  rho = np.where(ok, rho, np.nan)
+  rho = cv2.resize(rho, (W, H), interpolation=cv2.INTER_NEAREST)
+  if densify:
+    valid = np.isfinite(rho)
+    grid = BilateralGrid(img, sigma_xy, sigma_r)
+    filt = grid.solver(valid.astype(np.float64), solver_lam)
+    rho, _ = planar_filter(np.where(valid, rho, 0), filt)
+    rho = np.where((rho >= lo) & (rho <= hi), rho, np.nan)
+  sig = 0.05 * rho
+  return rho, sig
+
+
+def densified(rc, k, engine='combined', **kw):
+  '''an engine's map densified by the planar bilateral solver (the confident pixels: sigma below the median)'''
+  rho, sig = ENGINES[engine](rc, k)
+  img = rc.image(k)
+  valid = np.isfinite(rho) & (rho > 0)
+  grid = BilateralGrid(img, kw.get('sigma_xy', 16.0), kw.get('sigma_r', 16.0))
+  filt = grid.solver(valid.astype(np.float64), kw.get('solver_lam', 4.0))
+  out, _ = planar_filter(np.where(valid, rho, 0), filt)
+  lo, hi = sparse_range(rc, k)
+  out = np.where((out >= lo) & (out <= hi), out, np.nan)
+  return out, 0.05 * out
+
+
+ENGINES = {'sparse': sparse, 'dis': dis, 'multi': multi_baseline, 'combined': combined, 'sequential': sequential, 'refined': refined, 'patchmatch': patchmatch, 'google': google, 'densified': densified}
 
 
 # ------------------------------------------------------------------------------------------------- evaluation
