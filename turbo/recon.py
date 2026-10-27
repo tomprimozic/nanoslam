@@ -590,7 +590,246 @@ def refined(rc, k, window=40, half=2, sigma_i=2.0, min_grad=2.0, max_cost=0.5):
   return out, sig * calibrate(rc, k, out, sig)
 
 
-ENGINES = {'sparse': sparse, 'dis': dis, 'multi': multi_baseline, 'combined': combined, 'sequential': sequential, 'refined': refined}
+@njit(cache=True, nogil=True)
+def pm_cost(ref, others, K, Kinv, R, t, u, v, z, n0, n1, n2, half, best_k, sigma_c=20.0):
+  '''
+  slanted-plane matching cost of reference pixel (u, v) with the plane through its point at depth z with normal n:
+  every patch sample is intersected with the plane and projected into each view; per view 1 - ZNCC, bilaterally
+  weighted (COLMAP: samples unlike the centre pixel count less, against foreground fattening); the mean of the best_k
+  views (robust to occlusion)
+  '''
+  h, w = ref.shape
+  F = len(others)
+  x0 = Kinv[0, 0] * u + Kinv[0, 2]
+  x1 = Kinv[1, 1] * v + Kinv[1, 2]
+  nd = n0 * x0 * z + n1 * x1 * z + n2 * z      # n . X
+  m = (2 * half + 1) ** 2
+  a = np.empty(m)
+  b = np.empty(m)
+  wt = np.empty(m)
+  costs = np.empty(F)
+  c0 = ref[v, u]
+  ss = 2.0 * half * half
+  k = 0
+  for dv in range(-half, half + 1):
+    for du in range(-half, half + 1):
+      a[k] = ref[v + dv, u + du]
+      d = a[k] - c0
+      wt[k] = np.exp(-d * d / (2 * sigma_c * sigma_c) - (du * du + dv * dv) / ss)
+      k += 1
+  sw = np.sum(wt)
+  a -= np.sum(wt * a) / sw
+  na = np.sqrt(np.sum(wt * a * a))
+  if na < 1e-3:
+    return 2.0
+  for f in range(F):
+    ok = True
+    k = 0
+    for dv in range(-half, half + 1):
+      for du in range(-half, half + 1):
+        q0 = Kinv[0, 0] * (u + du) + Kinv[0, 2]
+        q1 = Kinv[1, 1] * (v + dv) + Kinv[1, 2]
+        den = n0 * q0 + n1 * q1 + n2
+        if abs(den) < 1e-9:
+          ok = False
+          break
+        s = nd / den
+        if s <= 0:
+          ok = False
+          break
+        Y0 = R[f, 0, 0] * q0 * s + R[f, 0, 1] * q1 * s + R[f, 0, 2] * s + t[f, 0]
+        Y1 = R[f, 1, 0] * q0 * s + R[f, 1, 1] * q1 * s + R[f, 1, 2] * s + t[f, 1]
+        Y2 = R[f, 2, 0] * q0 * s + R[f, 2, 1] * q1 * s + R[f, 2, 2] * s + t[f, 2]
+        if Y2 <= 1e-6:
+          ok = False
+          break
+        pu = K[0, 0] * Y0 / Y2 + K[0, 2]
+        pv = K[1, 1] * Y1 / Y2 + K[1, 2]
+        if pu < 0 or pv < 0 or pu >= w - 1 or pv >= h - 1:
+          ok = False
+          break
+        iu, iv = int(pu), int(pv)
+        fu, fv = pu - iu, pv - iv
+        b[k] = ((1 - fu) * (1 - fv) * others[f, iv, iu] + fu * (1 - fv) * others[f, iv, iu + 1] +
+                (1 - fu) * fv * others[f, iv + 1, iu] + fu * fv * others[f, iv + 1, iu + 1])
+        k += 1
+      if not ok:
+        break
+    if not ok:
+      costs[f] = 2.0
+      continue
+    b -= np.sum(wt * b) / sw
+    nb = np.sqrt(np.sum(wt * b * b))
+    costs[f] = 2.0 if nb < 1e-3 else 1.0 - np.sum(wt * a * b) / (na * nb)
+  costs.sort()
+  kk = min(best_k, F)
+  return np.mean(costs[:kk])
+
+
+@njit(cache=True, parallel=True)
+def pm_iterate(ref, others, K, Kinv, R, t, z, n, cost, lo, hi, half, best_k, scale, seed):
+  '''one PatchMatch iteration: red-black checkerboard; each pixel tries its neighbours' planes (near and far) and a
+  random perturbation of its own; keeps the cheapest'''
+  h, w = ref.shape
+  for color in range(2):
+    for v in prange(half, h - half):
+      np.random.seed(seed + v * 7919 + color)
+      for u in range(half + (v + color) % 2, w - half, 2):
+        best = cost[v, u]
+        bz, b0, b1, b2 = z[v, u], n[v, u, 0], n[v, u, 1], n[v, u, 2]
+        for (dy, dx) in ((-1, 0), (1, 0), (0, -1), (0, 1), (-5, 0), (5, 0), (0, -5), (0, 5)):
+          y, x = v + dy, u + dx
+          if y < half or y >= h - half or x < half or x >= w - half:
+            continue
+          # the neighbour's plane, evaluated at this pixel: depth where this pixel's ray meets it
+          xn0 = Kinv[0, 0] * x + Kinv[0, 2]
+          xn1 = Kinv[1, 1] * y + Kinv[1, 2]
+          m0, m1, m2 = n[y, x, 0], n[y, x, 1], n[y, x, 2]
+          ndn = (m0 * xn0 + m1 * xn1 + m2) * z[y, x]
+          x0 = Kinv[0, 0] * u + Kinv[0, 2]
+          x1 = Kinv[1, 1] * v + Kinv[1, 2]
+          den = m0 * x0 + m1 * x1 + m2
+          if abs(den) < 1e-9:
+            continue
+          zc = ndn / den
+          if zc < lo or zc > hi:
+            continue
+          c = pm_cost(ref, others, K, Kinv, R, t, u, v, zc, m0, m1, m2, half, best_k)
+          if c < best:
+            best, bz, b0, b1, b2 = c, zc, m0, m1, m2
+        # random refinement of the current best
+        zr = bz * np.exp(np.random.normal() * 0.05 * scale)
+        r0, r1, r2 = b0 + np.random.normal() * 0.15 * scale, b1 + np.random.normal() * 0.15 * scale, b2 + np.random.normal() * 0.15 * scale
+        nr = np.sqrt(r0 * r0 + r1 * r1 + r2 * r2)
+        r0, r1, r2 = r0 / nr, r1 / nr, r2 / nr
+        x0 = Kinv[0, 0] * u + Kinv[0, 2]
+        x1 = Kinv[1, 1] * v + Kinv[1, 2]
+        if r0 * x0 + r1 * x1 + r2 < 0 and lo <= zr <= hi:     # (facing the camera)
+          c = pm_cost(ref, others, K, Kinv, R, t, u, v, zr, r0, r1, r2, half, best_k)
+          if c < best:
+            best, bz, b0, b1, b2 = c, zr, r0, r1, r2
+        # a random normal (facing the camera) at the current depth, the current normal at a random depth
+        r0, r1, r2 = np.random.normal(), np.random.normal(), np.random.normal()
+        nr = np.sqrt(r0 * r0 + r1 * r1 + r2 * r2)
+        r0, r1, r2 = r0 / nr, r1 / nr, r2 / nr
+        if r0 * x0 + r1 * x1 + r2 > 0:
+          r0, r1, r2 = -r0, -r1, -r2
+        if r0 * x0 + r1 * x1 + r2 < -0.1:
+          c = pm_cost(ref, others, K, Kinv, R, t, u, v, bz, r0, r1, r2, half, best_k)
+          if c < best:
+            best, b0, b1, b2 = c, r0, r1, r2
+        zr = 1.0 / (1.0 / hi + np.random.random() * (1.0 / lo - 1.0 / hi))
+        c = pm_cost(ref, others, K, Kinv, R, t, u, v, zr, b0, b1, b2, half, best_k)
+        if c < best:
+          best, bz = c, zr
+        cost[v, u] = best
+        z[v, u] = bz
+        n[v, u, 0], n[v, u, 1], n[v, u, 2] = b0, b1, b2
+
+
+def patchmatch(rc, k, views=6, half=3, best_k=3, iterations=4, scale=2, max_cost=0.5, init='combined', planes=0,
+               plane_tol=0.05, full=True):
+  '''
+  multi-view PatchMatch with slanted planes (Gipuma / COLMAP style, ZNCC instead of Google's learned HashMatch): per
+  pixel a depth and a normal; patches are warped into the covisible keyframes through the plane, so surfaces seen at
+  grazing angles (floors) still match; red-black propagation + random refinement; half resolution. With planes > 0
+  the dominant planes of the confident pixels are offered to every pixel afterwards (a planar prior, after ACMP): a
+  pixel takes a plane if it matches nearly as well (cost within plane_tol)
+  '''
+  img = rc.image(k)
+  H, W = img.shape
+  nbrs = rc.covisible(k, views)
+  if len(nbrs) == 0:
+    return np.full((H, W), np.nan), np.full((H, W), np.nan)
+  h, w = H // scale, W // scale
+  ref = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+  others = np.array([cv2.resize(rc.image(j), (w, h), interpolation=cv2.INTER_AREA) for j in nbrs], np.float32)
+  Ks = rc.K.copy()
+  Ks[:2] /= scale
+  Ks[:2, 2] = (rc.K[:2, 2] + 0.5) / scale - 0.5
+  Kinv = np.linalg.inv(Ks)
+  rel = np.array([rc.T[j] @ np.linalg.inv(rc.T[k]) for j in nbrs])
+  R, t = rel[:, :3, :3].copy(), rel[:, :3, 3].copy()
+  a, b = sparse_range(rc, k)
+  lo, hi = 1 / b, 1 / max(a, 1e-9)       # depth range
+  rng = np.random.default_rng(k)
+  z = 1 / rng.uniform(a, b, (h, w))
+  if init == 'combined':
+    r0, _ = combined(rc, k)
+    r0 = cv2.resize(r0, (w, h), interpolation=cv2.INTER_NEAREST)
+    z = np.where(np.isfinite(r0) & (r0 > 0), 1 / np.where(r0 > 0, r0, 1), z)
+  z = np.clip(z, lo, hi)
+  n = np.zeros((h, w, 3))
+  n[..., 2] = -1.0
+  cost = pm_init_costs(ref, others, Ks, Kinv, R, t, z, n, half, best_k)
+  for it in range(iterations):
+    pm_iterate(ref, others, Ks, Kinv, R, t, z, n, cost, lo, hi, half, best_k, 0.5 ** it, 1000 * it + k)
+  vv, uu = np.mgrid[0:h, 0:w]
+  ray = np.stack([Kinv[0, 0] * uu + Kinv[0, 2], Kinv[1, 1] * vv + Kinv[1, 2], np.ones((h, w))], -1)
+  if planes:
+    good = cost < 0.5 * max_cost
+    for p_n, p_d in fit_planes(ray[good] * z[good][:, None], planes, rng):
+      den = ray @ p_n
+      zp = np.where(np.abs(den) > 1e-9, p_d / np.where(np.abs(den) > 1e-9, den, 1), -1)
+      inside = (zp >= lo) & (zp <= hi)
+      zp = np.where(inside, zp, z)
+      cp = pm_init_costs(ref, others, Ks, Kinv, R, t, zp, np.broadcast_to(p_n, (h, w, 3)).copy(), half, best_k)
+      take = inside & (cp < max_cost) & (cp < cost + plane_tol)
+      z, cost = np.where(take, zp, z), np.where(take, np.minimum(cp, cost), cost)
+      n[take] = p_n
+  ok = cost < max_cost
+  rho = np.where(ok, 1 / z, np.nan)
+  sig = np.where(ok, 0.05 * rho * (0.5 + cost), np.nan)      # (scaled by calibrate())
+  if not full:
+    return rho, sig, n, cost
+  return cv2.resize(rho, (W, H), interpolation=cv2.INTER_NEAREST), cv2.resize(sig, (W, H), interpolation=cv2.INTER_NEAREST)
+
+
+def fit_planes(X, max_planes, rng, rel_tol=0.01, min_share=0.08, iterations=500):
+  '''
+  sequential RANSAC for the dominant planes n . X = d (camera frame, n towards the camera) of a point cloud; residuals
+  relative to depth; a plane needs min_share of the points; refit by least squares on the inliers
+  '''
+  out = []
+  left = X
+  N0 = len(X)
+  for _ in range(max_planes):
+    if len(left) < 3 or len(left) < min_share * N0:
+      break
+    best, best_in = None, None
+    for _ in range(iterations):
+      P = left[rng.choice(len(left), 3, replace=False)]
+      nrm = np.cross(P[1] - P[0], P[2] - P[0])
+      if np.linalg.norm(nrm) < 1e-12:
+        continue
+      nrm /= np.linalg.norm(nrm)
+      inl = np.abs(left @ nrm - nrm @ P[0]) < rel_tol * left[:, 2]
+      if best_in is None or inl.sum() > best_in.sum():
+        best, best_in = nrm, inl
+    if best_in is None or best_in.sum() < min_share * N0:
+      break
+    Q = left[best_in]
+    c = Q.mean(0)
+    nrm = np.linalg.svd(Q - c, full_matrices=False)[2][-1]
+    d = nrm @ c
+    if d > 0:                              # (normal facing the camera: n . X < 0 at the plane)
+      nrm, d = -nrm, -d
+    out.append((nrm, d))
+    left = left[~(np.abs(left @ nrm - d) < rel_tol * left[:, 2])]
+  return out
+
+
+@njit(cache=True, parallel=True)
+def pm_init_costs(ref, others, K, Kinv, R, t, z, n, half, best_k):
+  h, w = ref.shape
+  cost = np.full((h, w), 2.0)
+  for v in prange(half, h - half):
+    for u in range(half, w - half):
+      cost[v, u] = pm_cost(ref, others, K, Kinv, R, t, u, v, z[v, u], n[v, u, 0], n[v, u, 1], n[v, u, 2], half, best_k)
+  return cost
+
+
+ENGINES = {'sparse': sparse, 'dis': dis, 'multi': multi_baseline, 'combined': combined, 'sequential': sequential, 'refined': refined, 'patchmatch': patchmatch}
 
 
 # ------------------------------------------------------------------------------------------------- evaluation
@@ -837,12 +1076,61 @@ def surface_colors(points, color, origin, voxel):
   return color[idx[:, 0], idx[:, 1], idx[:, 2]]
 
 
-def timelapse(rc, refined, online, path, fuse_every=30, delay=32, depth_step=6, dense_step=5, with_mesh=False):
+def voxelize(P, C, size, min_points=3):
+  '''the cells of a size grid (display frame, metres) holding at least min_points points, and their mean colours'''
+  key = np.floor(P / size).astype(np.int64)
+  cells, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+  col = np.zeros((len(cells), 3))
+  np.add.at(col, inv.ravel(), C)
+  col /= cnt[:, None]
+  keep = cnt >= min_points
+  return cells[keep], col[keep]
+
+
+def fill_floor(cells, colors, close=4):
+  '''
+  the floor layer (the most populated height in the lower part, +-1 cell) closed in 2D with a disk of radius close
+  cells: holes in the untextured floor filled with the colour of the nearest floor cell
+  '''
+  import scipy.ndimage as ndi
+  z = cells[:, 2]
+  hist = np.bincount(z - z.min())
+  low = max(1, len(hist) // 3)
+  floor = z.min() + int(np.argmax(hist[:low]))
+  on = np.abs(z - floor) <= 1
+  xy = cells[on, :2]
+  o = xy.min(0) - close
+  grid = np.zeros(tuple(xy.max(0) - o + close + 1), bool)
+  grid[xy[:, 0] - o[0], xy[:, 1] - o[1]] = True
+  cg = np.zeros(grid.shape + (3,))
+  cg[xy[:, 0] - o[0], xy[:, 1] - o[1]] = colors[on]
+  yy, xx = np.mgrid[-close:close + 1, -close:close + 1]
+  closed = ndi.binary_closing(grid, structure=yy ** 2 + xx ** 2 <= close ** 2)
+  new = closed & ~grid
+  _, (iy, ix) = ndi.distance_transform_edt(~grid, return_indices=True)
+  ny, nx = np.nonzero(new)
+  add = np.c_[ny + o[0], nx + o[1], np.full(len(ny), floor)]
+  return np.r_[cells, add], np.r_[colors, cg[iy[ny, nx], ix[ny, nx]]], floor
+
+
+def voxel_map(P, C, size=0.04, min_points=3, floor_close=4):
+  '''
+  a Matic-style voxel map of display-frame points (metres, +Z up): size cubes holding min_points points, coloured by
+  their mean colour; the floor layer's holes closed. Returns cube centres and colours
+  '''
+  cells, cols = voxelize(P, C.astype(np.float64), size, min_points)
+  if floor_close:
+    cells, cols, _ = fill_floor(cells, cols, floor_close)
+  return (cells + 0.5) * size, cols
+
+
+def timelapse(rc, refined, online, path, fuse_every=30, delay=32, depth_step=6, dense_step=5, with_mesh=False, cube=0.04):
   '''
   rerun recording on a frame timeline, in metres with +Z up (the trajectory aligned to the ground truth): the ground
   truth path, the SLAM path and camera moving; every keyframe's depth as it could be computed delay frames after it
   (online), fused into the TSDF as it arrives; the fused surface points (and optionally the mesh) and the dense points
-  (raw points near the fused surface) refreshed every fuse_every keyframes; at the end everything refined
+  (raw points near the fused surface) and the voxel map (cube metres, floor holes closed) refreshed every fuse_every
+  keyframes; at the end everything refined
   '''
   import rerun as rr
   rr.init('nanoslam-recon-timelapse')
@@ -860,6 +1148,9 @@ def timelapse(rc, refined, online, path, fuse_every=30, delay=32, depth_step=6, 
       rr.log('world/fused_mesh', rr.Mesh3D(vertex_positions=disp(V), triangle_indices=Fc, vertex_colors=rgb(c)))
     P, C = dense_points(rc, maps, tsdf, weight, origin, voxel, step=dense_step)
     rr.log('world/dense', rr.Points3D(disp(P), colors=rgb(C), radii=0.002))
+    if cube:
+      X, c = voxel_map(np.r_[disp(S), disp(P)], np.r_[surface_colors(S, color, origin, voxel), C], cube)
+      rr.log('world/voxels', rr.Boxes3D(centers=X, half_sizes=np.full((len(X), 3), cube / 2), colors=rgb(c), fill_mode='solid'))
   t_ref = fuse(rc, refined, upto=-1)
   tsdf, weight, color = np.ones_like(t_ref[0]), np.zeros_like(t_ref[1]), np.zeros_like(t_ref[4])
   origin, voxel = t_ref[2], t_ref[3]
