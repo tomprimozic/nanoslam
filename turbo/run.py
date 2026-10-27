@@ -57,6 +57,17 @@ def perturbed(seed, factor=1.4):
   return overrides
 
 
+def save_map(slam, path, start=0):
+  '''the final map: alive keyframes (dataset frame index, T_cw), mapped points, their observations'''
+  from map import MAPPED
+  m = slam.map
+  kfs = np.flatnonzero(m.kfs.alive)
+  pts = np.flatnonzero(m.pts.state == MAPPED)
+  o = m.obs_of(kfs=kfs, pts=pts)
+  np.savez_compressed(path, kf_id=kfs, kf_frame=m.kfs.frame[kfs] + start, kf_T=m.kfs.T[kfs], pt_id=pts, pt_X=m.pts.X[pts],
+                      obs_kf=m.obs.kf[o], obs_pt=m.obs.pt[o], obs_uv=m.obs.uv[o], K=slam.K)
+
+
 def frame_range(x, metrics, n):
   '''the frames of a saved run (older runs without "start" went to the end of the sequence)'''
   start = metrics.get('start')
@@ -111,6 +122,7 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
              online_poses=T_online,
              **{f'stats_{k}': getattr(slam.stats, k) for k in slam.stats._spec})
     (out / 'metrics.json').write_text(json.dumps(result | {'event_list': slam.events}, indent=1, default=float))
+    save_map(slam, out / 'map.npz', start)
     evaluate.plot(m_online, gt, out / 'trajectory.png', title=f'{name} (live)')
   return result
 
