@@ -727,7 +727,7 @@ def pm_iterate(ref, others, K, Kinv, R, t, z, n, cost, lo, hi, half, best_k, sca
         n[v, u, 0], n[v, u, 1], n[v, u, 2] = b0, b1, b2
 
 
-def patchmatch(rc, k, views=6, half=3, best_k=3, iterations=4, scale=2, max_cost=0.5, init='combined', planes=0,
+def patchmatch(rc, k, views=6, half=5, best_k=3, iterations=4, scale=2, max_cost=0.5, init='combined', planes=0,
                plane_tol=0.05, full=True):
   '''
   multi-view PatchMatch with slanted planes (Gipuma / COLMAP style, ZNCC instead of Google's learned HashMatch): per
@@ -1446,66 +1446,75 @@ def voxel_map(P, C, size=0.04, min_points=3, floor_close=4):
   return (cells + 0.5) * size, cols
 
 
-def timelapse(rc, refined, online, path, fuse_every=30, delay=32, depth_step=6, dense_step=5, with_mesh=False, cube=0.04):
+def timelapse(rc, engines, path, fuse_every=10, delay=32, depth_step=6, dense_step=6, with_mesh=False, cube=0.0):
   '''
   rerun recording on a frame timeline, in metres with +Z up (the trajectory aligned to the ground truth): the ground
-  truth path, the SLAM path and camera moving; every keyframe's depth as it could be computed delay frames after it
-  (online), fused into the TSDF as it arrives; the fused surface points (and optionally the mesh) and the dense points
-  (raw points near the fused surface) and the voxel map (cube metres, floor holes closed) refreshed every fuse_every
-  keyframes; at the end everything refined
+  truth path, the SLAM path and camera moving; per engine (name -> (refined maps, online maps); side by side views when
+  several) every keyframe's depth as it could be computed delay frames after it (online), fused into its TSDF as it
+  arrives; the fused surface points (optionally the mesh), the dense points (raw points near the fused surface) and
+  optionally the voxel map (cube metres, floor holes closed) refreshed every fuse_every keyframes; at the end
+  everything refined
   '''
   import rerun as rr
+  import rerun.blueprint as rrb
   rr.init('nanoslam-recon-timelapse')
   rr.save(path)
+  names = list(engines)
+  if len(names) > 1:
+    rr.send_blueprint(rrb.Blueprint(rrb.Horizontal(*[rrb.Spatial3DView(
+      name=n, origin='/world', contents=['+ /world/**'] + [f'- /world/{m}/**' for m in names if m != n]) for n in names]),
+      collapse_panels=True))
   rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
   disp, R_disp, R_up = rc.display_frame()
   G = rc.data.gt
   okg = np.isfinite(G[:, 0, 3])
   rr.log('world/gt_path', rr.LineStrips3D([G[okg, :3, 3] @ R_up.T], radii=0.004, colors=[150, 150, 150]), static=True)
-  def log_model(tsdf, weight, origin, voxel, color, maps):
+  def log_model(name, tsdf, weight, origin, voxel, color, maps):
     S = surface_points(tsdf, weight, origin, voxel, 1 / (0.5 * voxel) ** 2)
-    rr.log('world/fused_surface', rr.Points3D(disp(S), colors=rgb(surface_colors(S, color, origin, voxel)), radii=0.004))
+    rr.log(f'world/{name}/fused_surface', rr.Points3D(disp(S), colors=rgb(surface_colors(S, color, origin, voxel)), radii=0.004))
     if with_mesh:
       V, Fc, c = mesh(tsdf, weight, origin, voxel, color, 1 / (0.5 * voxel) ** 2)
-      rr.log('world/fused_mesh', rr.Mesh3D(vertex_positions=disp(V), triangle_indices=Fc, vertex_colors=rgb(c)))
+      rr.log(f'world/{name}/fused_mesh', rr.Mesh3D(vertex_positions=disp(V), triangle_indices=Fc, vertex_colors=rgb(c)))
     P, C = dense_points(rc, maps, tsdf, weight, origin, voxel, step=dense_step)
-    rr.log('world/dense', rr.Points3D(disp(P), colors=rgb(C), radii=0.002))
+    rr.log(f'world/{name}/dense', rr.Points3D(disp(P), colors=rgb(C), radii=0.002))
     if cube:
       X, c = voxel_map(np.r_[disp(S), disp(P)], np.r_[surface_colors(S, color, origin, voxel), C], cube)
-      rr.log('world/voxels', rr.Boxes3D(centers=X, half_sizes=np.full((len(X), 3), cube / 2), colors=rgb(c), fill_mode='solid'))
-  t_ref = fuse(rc, refined, upto=-1)
-  tsdf, weight, color = np.ones_like(t_ref[0]), np.zeros_like(t_ref[1]), np.zeros_like(t_ref[4])
-  origin, voxel = t_ref[2], t_ref[3]
-  trunc = 4 * voxel
+      rr.log(f'world/{name}/voxels', rr.Boxes3D(centers=X, half_sizes=np.full((len(X), 3), cube / 2), colors=rgb(c), fill_mode='solid'))
+  state = {}
+  for n, (refined, online) in engines.items():
+    t_ref = fuse(rc, refined, upto=-1)
+    state[n] = [np.ones_like(t_ref[0]), np.zeros_like(t_ref[1]), t_ref[2], t_ref[3], np.zeros_like(t_ref[4]), []]
   img_h, img_w = rc.image(0).shape
   centers = np.array([np.linalg.inv(T)[:3, 3] if np.isfinite(T[0, 0]) else np.full(3, np.nan) for T in rc.frame_T])
-  avail = {k: int(rc.frame[k]) + delay for k in online}
+  avail = {k: int(rc.frame[k]) + delay for k in range(len(rc))}
   last_frame = max(avail.values())
-  done = []
-  for f in range(0, min(last_frame + 1, len(rc.frame_T)), 2):
+  for f in range(0, last_frame + 2, 2):
     rr.set_time('frame', sequence=f)
-    if np.isfinite(rc.frame_T[f, 0, 0]):
+    if f < len(rc.frame_T) and np.isfinite(rc.frame_T[f, 0, 0]):
       T_wc = np.linalg.inv(rc.frame_T[f])
       rr.log('world/camera', rr.Transform3D(translation=disp(T_wc[:3, 3][None])[0], mat3x3=R_disp @ T_wc[:3, :3]))
       rr.log('world/camera', rr.Pinhole(image_from_camera=rc.K, width=img_w, height=img_h, image_plane_distance=0.15))
       seen = centers[:f + 1]
       rr.log('world/slam_path', rr.LineStrips3D([disp(seen[np.isfinite(seen).all(axis=1)])], radii=0.004, colors=[255, 200, 0]))
-    for k in [k for k in online if avail[k] <= f and k not in done]:
-      done.append(k)
-      rho, sig = online[k]
-      img_c = rc.color(k)
-      X, c = backproject(rc.K, rc.T[k], rho, depth_step, img_c)
-      rr.log(f'world/keyframe_depth/{k}', rr.Points3D(disp(X), colors=rgb(c), radii=0.002))
-      tsdf_integrate(tsdf, weight, color, origin, voxel, rc.K, rc.T[k], np.nan_to_num(rho, nan=-1.0),
-                     np.nan_to_num(sig, nan=1.0), img_c.astype(np.float32), trunc, 1e12, 2)
-      if len(done) % fuse_every == 0:
-        log_model(tsdf, weight, origin, voxel, color, {j: online[j] for j in done})
+    for n, (refined, online) in engines.items():
+      tsdf, weight, origin, voxel, color, done = state[n]
+      for k in [k for k in online if avail[k] <= f and k not in done]:
+        done.append(k)
+        rho, sig = online[k]
+        img_c = rc.color(k)
+        X, c = backproject(rc.K, rc.T[k], rho, depth_step, img_c)
+        rr.log(f'world/{n}/keyframe_depth/{k}', rr.Points3D(disp(X), colors=rgb(c), radii=0.002))
+        tsdf_integrate(tsdf, weight, color, origin, voxel, rc.K, rc.T[k], np.nan_to_num(rho, nan=-1.0),
+                       np.nan_to_num(sig, nan=1.0), img_c.astype(np.float32), 4 * voxel, 1e12, 2)
+        if len(done) % fuse_every == 0:
+          log_model(n, tsdf, weight, origin, voxel, color, {j: online[j] for j in done})
   # the end: refined
-  rr.set_time('frame', sequence=last_frame + 2)
-  for k, (rho, _) in refined.items():
-    X, c = backproject(rc.K, rc.T[k], rho, depth_step, rc.color(k))
-    rr.log(f'world/keyframe_depth/{k}', rr.Points3D(disp(X), colors=rgb(c), radii=0.002))
-  log_model(*fuse(rc, refined), refined)
+  rr.set_time('frame', sequence=last_frame + 4)
+  for n, (refined, online) in engines.items():
+    for k, (rho, _) in refined.items():
+      X, c = backproject(rc.K, rc.T[k], rho, depth_step, rc.color(k))
+      rr.log(f'world/{n}/keyframe_depth/{k}', rr.Points3D(disp(X), colors=rgb(c), radii=0.002))
+    log_model(n, *fuse(rc, refined), refined)
 
 
 def compute_maps(rc, engine, cache=None):
@@ -1617,7 +1626,8 @@ def visualize(rc, k, rho, gt, scale, path):
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('runs', nargs='+')
-  ap.add_argument('--engine', default='sparse', choices=sorted(ENGINES))
+  ap.add_argument('--engine', default='sparse', help=f'one of {sorted(ENGINES)}; comma separated for --timelapse (side by side)')
+  ap.add_argument('--cube', type=float, default=0.0, help='--timelapse: voxel map with cubes of this size [m] (0: none)')
   ap.add_argument('--every', type=int, default=5, help='evaluate every n-th keyframe')
   ap.add_argument('--save', help='visualization of the first evaluated keyframe (directory)')
   ap.add_argument('--rerun', nargs='?', const='spawn', help='3D view in rerun (spawn a viewer, or save to the given .rrd)')
@@ -1631,9 +1641,11 @@ def main():
       save.parent.mkdir(parents=True, exist_ok=True)
     if args.timelapse:
       rc = Recon(r)
-      maps, _ = compute_maps(rc, args.engine, Path(r) / f'recon_{args.engine}.npz')
-      online = online_maps(rc, args.engine, cache=Path(r) / f'recon_{args.engine}_online.npz')
-      timelapse(rc, maps, online, args.timelapse)
+      engines = {}
+      for e in args.engine.split(','):
+        maps, _ = compute_maps(rc, e, Path(r) / f'recon_{e}.npz')
+        engines[e] = (maps, online_maps(rc, e, cache=Path(r) / f'recon_{e}_online.npz'))
+      timelapse(rc, engines, args.timelapse, cube=args.cube)
       continue
     res = run(r, args.engine, args.every, save, args.rerun, [f for f in args.filters.split(',') if f], args.fuse)
     print(f'{Path(r).name:32s} {args.engine:10s} ' + '  '.join(f'{k} {v:.3f}' if isinstance(v, float) else f'{k} {v}' for k, v in res.items()))
