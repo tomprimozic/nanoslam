@@ -62,11 +62,24 @@ class Dataset:
   def __len__(self):
     return len(self.files)
 
+  def depth(self, i):
+    '''ground-truth depth [m] of frame i in the (undistorted) camera, 0 where unknown; None if the dataset has none'''
+    return None
+
+  up = np.array([0.0, 0.0, 1.0])    # the ground truth's world up
+
   def load(self, i):
     img = cv2.imread(str(self.files[i]), cv2.IMREAD_GRAYSCALE)
     if self.maps is not None:
       img = cv2.remap(img, *self.maps, cv2.INTER_LINEAR)
     return img
+
+  def load_color(self, i):
+    '''RGB (grey images repeated)'''
+    img = cv2.imread(str(self.files[i]), cv2.IMREAD_COLOR)
+    if self.maps is not None:
+      img = cv2.remap(img, *self.maps, cv2.INTER_LINEAR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
   def images(self, start=0, stop=None, prefetch=8):
     '''yields (index, image), loading ahead in background threads (cv2 releases the GIL)'''
@@ -98,6 +111,22 @@ class TUM(Dataset):
     self.height, self.width = cv2.imread(str(self.files[0]), cv2.IMREAD_GRAYSCALE).shape
     intrinsics, dist = self.CAMERAS[self.name.split('_')[0]]
     self.setup_undistortion(make_K(*intrinsics), None if dist is None else np.array(dist))
+    self.depth_files = None
+    if (path / 'depth.txt').exists() and (path / 'depth').is_dir():
+      dep = pd.read_csv(path / 'depth.txt', sep=' ', comment='#', names=['t', 'file'])
+      j = np.clip(np.searchsorted(dep.t.to_numpy(), self.timestamps), 1, len(dep) - 1)
+      j = np.where(np.abs(dep.t.to_numpy()[j - 1] - self.timestamps) < np.abs(dep.t.to_numpy()[j] - self.timestamps), j - 1, j)
+      close = np.abs(dep.t.to_numpy()[j] - self.timestamps) < 0.02
+      self.depth_files = [path / dep.file.iloc[k] if ok else None for k, ok in zip(j, close)]
+
+  def depth(self, i):
+    '''the Kinect depth registered to the RGB image (nearest timestamp within 20 ms), undistorted like the image'''
+    if self.depth_files is None or self.depth_files[i] is None:
+      return None
+    d = cv2.imread(str(self.depth_files[i]), cv2.IMREAD_UNCHANGED).astype(np.float32) / 5000
+    if self.maps is not None:
+      d = cv2.remap(d, *self.maps, cv2.INTER_NEAREST)
+    return d
 
 
 class EuRoC(Dataset):
@@ -117,6 +146,48 @@ class EuRoC(Dataset):
     self.gt = T_wb @ T_bc
     self.width, self.height = cam['resolution']
     self.setup_undistortion(make_K(*cam['intrinsics']), np.array(cam['distortion_coefficients']))
+    self.scan_path = mav / 'pointcloud0' / 'data.ply'
+    self._scan = None
+
+  def scan(self):
+    '''the laser scan (N, 3) in the world frame (cached as .npy next to the .ply), or None'''
+    if self._scan is None and self.scan_path.exists():
+      cache = self.scan_path.with_suffix('.npy')
+      if not cache.exists():
+        with open(self.scan_path) as f:
+          n = 0
+          for line in f:
+            if line.startswith('element vertex'):
+              n = int(line.split()[2])
+            if line.startswith('end_header'):
+              break
+          xyz = np.loadtxt(f, usecols=(0, 1, 2), max_rows=n, dtype=np.float32)
+        np.save(cache, xyz)
+      self._scan = np.load(cache)
+    return self._scan
+
+  def depth(self, i):
+    '''the laser scan rendered into frame i (z-buffer, 2x2 splats; pixels behind a nearer surface dropped)'''
+    X = self.scan()
+    if X is None or not np.isfinite(self.gt[i]).all():
+      return None
+    T_cw = np.linalg.inv(self.gt[i])
+    Xc = X @ T_cw[:3, :3].T.astype(np.float32) + T_cw[:3, 3].astype(np.float32)
+    Xc = Xc[Xc[:, 2] > 0.1]
+    u = self.K[0, 0] * Xc[:, 0] / Xc[:, 2] + self.K[0, 2]
+    v = self.K[1, 1] * Xc[:, 1] / Xc[:, 2] + self.K[1, 2]
+    z = np.full(self.height * self.width, np.inf, np.float32)
+    order = np.argsort(-Xc[:, 2])         # (nearest last: it wins)
+    for du in (0, 1):
+      for dv in (0, 1):
+        ui, vi = np.floor(u - 0.5).astype(int) + du, np.floor(v - 0.5).astype(int) + dv
+        ok = (ui >= 0) & (ui < self.width) & (vi >= 0) & (vi < self.height)
+        o = order[ok[order]]
+        np.minimum.at(z, vi[o] * self.width + ui[o], Xc[o, 2])
+    z = z.reshape(self.height, self.width)
+    near = cv2.erode(np.where(np.isfinite(z), z, 1e9).astype(np.float32), np.ones((5, 5), np.uint8))
+    z[~np.isfinite(z) | (z > 1.1 * near)] = 0
+    return z
 
 
 class TartanAir(Dataset):
@@ -134,6 +205,17 @@ class TartanAir(Dataset):
     self.gt = T @ T_ned_optical
     self.width, self.height = 640, 480
     self.setup_undistortion(make_K(320, 320, 320, 240), None)
+    self.up = np.array([0.0, 0.0, -1.0])     # (NED)
+    self.depth_dir = path / 'depth_left'
+
+  def depth(self, i):
+    '''the rendered depth (sky and beyond 100 m: unknown)'''
+    f = self.depth_dir / self.files[i].name.replace('_left.png', '_left_depth.npy')
+    if not f.exists():
+      return None
+    d = np.load(f).astype(np.float32)
+    d[~(d < 100)] = 0
+    return d
 
 
 def all_names():
