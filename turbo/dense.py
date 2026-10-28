@@ -19,6 +19,7 @@ the keyframe's own map points). Up is estimated from the keyframe orientations (
 import queue
 import threading
 import time
+import concurrent.futures
 
 import cv2
 import numpy as np
@@ -40,7 +41,8 @@ class DenseConfig:
   min_views = 2                     # keyframes agreeing on a pixel (chi2 test)
   # sweep
   window = 3.0                      # search window: DIS inverse depth +- window sigma
-  samples = 32                      # inverse-depth samples
+  samples = 32                      # inverse-depth samples (at most) ...
+  step_px = 0.5                     # ... about this far apart along the longest epipolar segment [px, sweep resolution]
   patch = 2                         # ZNCC patch half size (at the sweep's resolution)
   scale = 2                         # the sweep runs at 1/scale resolution
   sweep_views = 3                   # frames that must see a pixel
@@ -48,11 +50,20 @@ class DenseConfig:
   # fusion
   voxel = 0.01                      # voxel size relative to the median depth of the first keyframe
   truncation = 4                    # TSDF truncation [voxels]
-  surface_sigma = 0.5               # fused sigma of the extracted surface [voxels]
+  surface_sigma = 0.3               # fused sigma of the extracted surface [voxels]
   points_sigma = 1.0                # dense points: next to voxels with this fused sigma [voxels] ...
   points_band = 0.5                 # ... and |tsdf| below this (fraction of the truncation)
   refuse = ('loop', 'merge')        # SLAM events after which the stored maps are fused again with the new poses
   refine = False                    # at the end: recompute every keyframe's map with all frames and keyframes
+  max_queue = 0                     # real time: skip a keyframe when this many maps are waiting (0: never skip)
+  # ablation switches (all on by default)
+  use_dis = True                    # off: the sweep searches the whole range everywhere
+  use_sweep = True                  # off: DIS only
+  chi2_test = True                  # off: DIS hypotheses averaged (inverse variance) without the compatibility test
+  calibrate = True                  # off: raw sigmas
+  sigma_weights = True              # off: every observation weighs 1 (KinectFusion), thresholds in observations:
+  min_count = (3, 2)                # ... surface, dense points
+  carve = True                      # off: free space in front of a surface does not update voxels
   threads = 0                       # worker threads for numba (0: all)
   # display
   log_every = 10                    # keyframes between rerun refreshes of the fused model
@@ -64,79 +75,139 @@ class DenseConfig:
 
 # ------------------------------------------------------------------------------------------------- depth estimation
 
-def triangulate_flow(K, R, t, uv, q):
+@njit(cache=True, nogil=True)
+def flow_depth(f, b, K, R, t, fb_px, epi_px, rho, sig):
   '''
-  inverse depth (in the reference view) of pixels uv seen at q in the other view: q = proj(K (R x / rho + t)), linear
-  in rho after multiplying out; returns rho, the distance of q from the epipolar line [px] and |dq/drho| [px per unit]
+  inverse depth (reference view) and sigma of every pixel's flow match q = p + f(p) in the other view, NaN where
+  rejected: forward-backward error |f(p) + b(q)| (bilinear) >= fb_px, or q >= epi_px from the epipolar line. The
+  projection q = proj(K (R x / rho + t)) is linear in rho after multiplying out (closed form); sigma = max(0.3 px,
+  forward-backward error) / |dq / drho|
   '''
-  x = np.c_[(uv[:, 0] - K[0, 2]) / K[0, 0], (uv[:, 1] - K[1, 2]) / K[1, 1], np.ones(len(uv))]
-  A = x @ (K @ R).T                       # K R x
-  B = K @ t                               # K t
-  # q (A_z + rho B_z) = A_xy + rho B_xy  ->  rho (q B_z - B_xy) = A_xy - q A_z
-  c = q * B[2] - B[:2]
-  a = A[:, :2] - q * A[:, 2:3]
-  rho = np.sum(a * c, axis=1) / np.maximum(np.sum(c * c, axis=1), 1e-12)
-  den = A[:, 2] + rho * B[2]
-  proj = (A[:, :2] + rho[:, None] * B[:2]) / den[:, None]
-  epi = np.linalg.norm(proj - q, axis=1)
-  dq = (B[:2] * den[:, None] - (A[:, :2] + rho[:, None] * B[:2]) * B[2]) / den[:, None] ** 2
-  return rho, epi, np.linalg.norm(dq, axis=1)
-
-
-def fuse_hypotheses(rho, sig, min_views, chi2=5.99):
-  '''
-  per pixel, hypotheses (N, H, W) with NaN for none: the largest set compatible with one of them (seed) by a chi2 test,
-  fused by inverse variance; NaN where fewer than min_views agree
-  '''
-  have = np.isfinite(rho)
-  d2 = (rho[:, None] - rho[None]) ** 2 / (sig[:, None] ** 2 + sig[None] ** 2)
-  compat = (d2 < chi2) & have[:, None] & have[None]
-  seed = np.argmax(compat.sum(axis=1), axis=0)
-  best = np.take_along_axis(compat, seed[None, None], axis=0)[0]     # (N, H, W): members of the best set
-  w = np.where(best, 1 / np.where(have, sig, 1) ** 2, 0)
-  fused = np.sum(w * np.nan_to_num(rho), axis=0) / np.maximum(w.sum(axis=0), 1e-300)
-  ok = best.sum(axis=0) >= min_views
-  return np.where(ok, fused, np.nan), np.where(ok, 1 / np.sqrt(np.maximum(w.sum(axis=0), 1e-300)), np.nan)
-
-
-def dis(c, K, img, T, keyframes, flow):
-  '''DIS flow to the keyframes [(image, T_cw)], triangulated with the known poses, fused across them'''
-  h, w = img.shape
-  vv, uu = np.mgrid[0:h, 0:w]
-  uv = np.c_[uu.ravel(), vv.ravel()].astype(np.float64)
-  rhos, sigs = [], []
-  for other, T_j in keyframes:
-    f = flow.calc(img, other, None)
-    b = flow.calc(other, img, None)
-    q = uv + f.reshape(-1, 2)
-    back = cv2.remap(b, q[:, 0].reshape(h, w).astype(np.float32), q[:, 1].reshape(h, w).astype(np.float32),
-                     cv2.INTER_LINEAR, borderValue=(1e6, 1e6)).reshape(-1, 2)
-    fb = np.linalg.norm(f.reshape(-1, 2) + back, axis=1)
-    rel = T_j @ inv_pose(T)
-    rho, epi, slope = triangulate_flow(K, rel[:3, :3], rel[:3, 3], uv, q)
-    ok = ((fb < c.fb_px) & (epi < c.epi_px) & (rho > 0) & (q[:, 0] >= 0) & (q[:, 0] < w) & (q[:, 1] >= 0)
-          & (q[:, 1] < h))
-    rhos.append(np.where(ok, rho, np.nan).reshape(h, w))
-    sigs.append(np.where(ok, np.maximum(0.3, fb) / np.maximum(slope, 1e-12), np.nan).reshape(h, w))
-  if not rhos:
-    return np.full((h, w), np.nan), np.full((h, w), np.nan)
-  return fuse_hypotheses(np.array(rhos), np.array(sigs), c.min_views)
+  h, w = rho.shape
+  B0 = K[0, 0] * t[0] + K[0, 2] * t[2]
+  B1 = K[1, 1] * t[1] + K[1, 2] * t[2]
+  B2 = t[2]
+  for v in range(h):
+    for u in range(w):
+      rho[v, u] = np.nan
+      sig[v, u] = np.nan
+      qx, qy = u + f[v, u, 0], v + f[v, u, 1]
+      if not (qx >= 0 and qy >= 0 and qx < w - 1 and qy < h - 1):
+        continue
+      iu, iv = int(qx), int(qy)
+      fu, fv = qx - iu, qy - iv
+      bx = ((1 - fu) * (1 - fv) * b[iv, iu, 0] + fu * (1 - fv) * b[iv, iu + 1, 0] + (1 - fu) * fv * b[iv + 1, iu, 0] +
+            fu * fv * b[iv + 1, iu + 1, 0])
+      by = ((1 - fu) * (1 - fv) * b[iv, iu, 1] + fu * (1 - fv) * b[iv, iu + 1, 1] + (1 - fu) * fv * b[iv + 1, iu, 1] +
+            fu * fv * b[iv + 1, iu + 1, 1])
+      fb = np.sqrt((f[v, u, 0] + bx) ** 2 + (f[v, u, 1] + by) ** 2)
+      if fb >= fb_px:
+        continue
+      x0 = (u - K[0, 2]) / K[0, 0]
+      x1 = (v - K[1, 2]) / K[1, 1]
+      r0 = R[0, 0] * x0 + R[0, 1] * x1 + R[0, 2]
+      r1 = R[1, 0] * x0 + R[1, 1] * x1 + R[1, 2]
+      r2 = R[2, 0] * x0 + R[2, 1] * x1 + R[2, 2]
+      A0, A1, A2 = K[0, 0] * r0 + K[0, 2] * r2, K[1, 1] * r1 + K[1, 2] * r2, r2
+      # q (A2 + rho B2) = A + rho B  ->  rho (q B2 - B) = A - q A2
+      c0, c1 = qx * B2 - B0, qy * B2 - B1
+      r = ((A0 - qx * A2) * c0 + (A1 - qy * A2) * c1) / max(c0 * c0 + c1 * c1, 1e-12)
+      den = A2 + r * B2
+      if not r > 0 or abs(den) < 1e-12:
+        continue
+      px, py = (A0 + r * B0) / den, (A1 + r * B1) / den
+      if (px - qx) ** 2 + (py - qy) ** 2 >= epi_px * epi_px:
+        continue
+      dx = (B0 * den - (A0 + r * B0) * B2) / (den * den)
+      dy = (B1 * den - (A1 + r * B1) * B2) / (den * den)
+      rho[v, u] = r
+      sig[v, u] = max(0.3, fb) / max(np.sqrt(dx * dx + dy * dy), 1e-12)
 
 
 @njit(cache=True, parallel=True, nogil=True)
-def plane_sweep(ref, others, K, R, t, lo, hi, S, half):
+def fuse_hypotheses(rho, sig, min_views, chi2):
   '''
-  cost (h, w, S) of inverse-depth samples in [lo, hi] for every reference pixel: sum over the other images that see
-  it of the truncated 1 - ZNCC of a (2 half + 1)^2 patch (fronto-parallel: sampled around the projected centre)
+  per pixel, hypotheses (N, H, W) with NaN for none: the largest set compatible with one of them (seed) by a chi2 test,
+  fused by inverse variance (Mur-Artal & Tardos 2015); NaN where fewer than min_views agree
+  '''
+  N, h, w = rho.shape
+  out, out_sig = np.full((h, w), np.nan), np.full((h, w), np.nan)
+  for v in prange(h):
+    for u in range(w):
+      best, seed = 0, -1
+      for i in range(N):
+        if not np.isfinite(rho[i, v, u]):
+          continue
+        n = 0
+        for j in range(N):
+          if np.isfinite(rho[j, v, u]) and (rho[i, v, u] - rho[j, v, u]) ** 2 < chi2 * (sig[i, v, u] ** 2 + sig[j, v, u] ** 2):
+            n += 1
+        if n > best:
+          best, seed = n, i
+      if best < min_views:
+        continue
+      sw, swr = 0.0, 0.0
+      for j in range(N):
+        if np.isfinite(rho[j, v, u]) and (rho[seed, v, u] - rho[j, v, u]) ** 2 < chi2 * (sig[seed, v, u] ** 2 + sig[j, v, u] ** 2):
+          wj = 1.0 / sig[j, v, u] ** 2
+          sw += wj
+          swr += wj * rho[j, v, u]
+      out[v, u] = swr / sw
+      out_sig[v, u] = 1.0 / np.sqrt(sw)
+  return out, out_sig
+
+
+class Flows:
+  '''DIS flow in a thread pool: one DIS instance per worker thread (cv2 releases the GIL)'''
+
+  def __init__(self, preset, threads):
+    self.preset = preset
+    self.local = threading.local()
+    self.pool = concurrent.futures.ThreadPoolExecutor(threads)
+
+  def calc(self, a, b):
+    if not hasattr(self.local, 'dis'):
+      self.local.dis = cv2.DISOpticalFlow_create(self.preset)
+    return self.local.dis.calc(a, b, None)
+
+  def map(self, fn, items):
+    return list(self.pool.map(fn, items))
+
+
+def dis(c, K, img, T, keyframes, flows):
+  '''DIS flow to the keyframes [(image, T_cw)] (in parallel), triangulated with the known poses, fused across them'''
+  h, w = img.shape
+  if not keyframes:
+    return np.full((h, w), np.nan), np.full((h, w), np.nan)
+  rho, sig = np.empty((len(keyframes), h, w)), np.empty((len(keyframes), h, w))
+
+  def one(i):
+    other, T_j = keyframes[i]
+    rel = T_j @ inv_pose(T)
+    flow_depth(flows.calc(img, other), flows.calc(other, img), K, rel[:3, :3].copy(), rel[:3, 3].copy(), c.fb_px,
+               c.epi_px, rho[i], sig[i])
+  flows.map(one, range(len(keyframes)))
+  return fuse_hypotheses(rho, sig, c.min_views, 5.99 if c.chi2_test else np.inf)
+
+
+@njit(cache=True, parallel=True, nogil=True, fastmath={'nsz', 'arcp', 'contract', 'afn', 'reassoc'})   # (no nnan / ninf: infs mark samples)
+def plane_sweep(ref, others, K, R, t, lo, hi, S, half, step_px, min_views, uniqueness):
+  '''
+  per reference pixel, inverse-depth samples in [lo, hi] (about step_px apart along the longest epipolar segment, at
+  most S), each scored by the mean over the other images that see it (at least min_views) of the truncated 1 - ZNCC
+  of a (2 half + 1)^2 patch (fronto-parallel: sampled around the projected centre); the minimum (uniqueness: below
+  uniqueness x the best one more than 2 samples away, not at the ends) refined by a parabola; sigma from its
+  curvature. NaN: none
   '''
   h, w = ref.shape
   F = len(others)
-  cost = np.zeros((h, w, S), np.float32)
-  count = np.zeros((h, w, S), np.int16)
+  rho, sig = np.full((h, w), np.nan), np.full((h, w), np.nan)
   n = (2 * half + 1) ** 2
   for v in prange(half, h - half):
     a = np.empty(n)
     b = np.empty(n)
+    cost = np.empty(S)
+    count = np.empty(S, np.int32)
     for u in range(half, w - half):
       if not hi[v, u] > lo[v, u]:
         continue
@@ -151,7 +222,23 @@ def plane_sweep(ref, others, K, R, t, lo, hi, S, half):
         continue
       x0 = (u - K[0, 2]) / K[0, 0]
       x1 = (v - K[1, 2]) / K[1, 1]
-      step = (hi[v, u] - lo[v, u]) / (S - 1)
+      span = 0.0
+      for f in range(F):
+        A0 = K[0, 0] * (R[f, 0, 0] * x0 + R[f, 0, 1] * x1 + R[f, 0, 2]) + K[0, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
+        A1 = K[1, 1] * (R[f, 1, 0] * x0 + R[f, 1, 1] * x1 + R[f, 1, 2]) + K[1, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
+        A2 = R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2]
+        B0 = K[0, 0] * t[f, 0] + K[0, 2] * t[f, 2]
+        B1 = K[1, 1] * t[f, 1] + K[1, 2] * t[f, 2]
+        B2 = t[f, 2]
+        z0, z1 = A2 + lo[v, u] * B2, A2 + hi[v, u] * B2
+        if z0 > 1e-6 and z1 > 1e-6:
+          du = (A0 + lo[v, u] * B0) / z0 - (A0 + hi[v, u] * B0) / z1
+          dv = (A1 + lo[v, u] * B1) / z0 - (A1 + hi[v, u] * B1) / z1
+          span = max(span, np.sqrt(du * du + dv * dv))
+      Sp = min(S, max(5, int(span / step_px) + 2))
+      step = (hi[v, u] - lo[v, u]) / (Sp - 1)
+      cost[:Sp] = 0.0
+      count[:Sp] = 0
       for f in range(F):
         # p(rho) = K (R x + rho t) / z = (A + rho B) / (A2 + rho B2)
         A0 = K[0, 0] * (R[f, 0, 0] * x0 + R[f, 0, 1] * x1 + R[f, 0, 2]) + K[0, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
@@ -160,7 +247,7 @@ def plane_sweep(ref, others, K, R, t, lo, hi, S, half):
         B0 = K[0, 0] * t[f, 0] + K[0, 2] * t[f, 2]
         B1 = K[1, 1] * t[f, 1] + K[1, 2] * t[f, 2]
         B2 = t[f, 2]
-        for s in range(S):
+        for s in range(Sp):
           rs = lo[v, u] + s * step
           z = A2 + rs * B2
           if z <= 1e-6:
@@ -180,9 +267,28 @@ def plane_sweep(ref, others, K, R, t, lo, hi, S, half):
               m += 1
           b -= b.mean()
           nb = np.sqrt(np.sum(b * b))
-          cost[v, u, s] += 1.0 if nb < 1e-3 else min(1.0 - np.sum(a * b) / (na * nb), 1.0)
-          count[v, u, s] += 1
-  return cost, count
+          cost[s] += 1.0 if nb < 1e-3 else min(1.0 - np.sum(a * b) / (na * nb), 1.0)
+          count[s] += 1
+      best, c0 = -1, np.inf
+      for s in range(Sp):
+        cost[s] = cost[s] / count[s] if count[s] >= min_views else np.inf
+        if cost[s] < c0:
+          best, c0 = s, cost[s]
+      if best <= 0 or best >= Sp - 1:
+        continue
+      c1 = np.inf
+      for s in range(Sp):
+        if abs(s - best) > 2:
+          c1 = min(c1, cost[s])
+      cl, cr = cost[best - 1], cost[best + 1]
+      if not (c0 < uniqueness * c1) or not (cl < np.inf and cr < np.inf):
+        continue
+      curv = cl + cr - 2 * c0
+      if not curv > 1e-6:
+        continue
+      rho[v, u] = lo[v, u] + (best + 0.5 * (cl - cr) / curv) * step
+      sig[v, u] = step / np.sqrt(curv) * np.sqrt(max(c0, 1e-3))
+  return rho, sig
 
 
 def sweep(c, K, img, T, views, lo, hi):
@@ -196,31 +302,14 @@ def sweep(c, K, img, T, views, lo, hi):
   if not views:
     return np.full((H, W), np.nan), np.full((H, W), np.nan)
   small = lambda im: cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
-  others = np.array([small(im) for im, _ in views])
   Ks = K.copy()
   Ks[:2] /= c.scale
   Ks[:2, 2] = (K[:2, 2] + 0.5) / c.scale - 0.5
   rel = np.array([T_j @ inv_pose(T) for _, T_j in views])
-  lo_s = cv2.resize(lo, (w, h), interpolation=cv2.INTER_NEAREST)
-  hi_s = cv2.resize(hi, (w, h), interpolation=cv2.INTER_NEAREST)
-  S = c.samples
-  cost, count = plane_sweep(small(img), others, Ks, rel[:, :3, :3].copy(), rel[:, :3, 3].copy(),
-                            np.nan_to_num(lo_s, nan=1.0), np.nan_to_num(hi_s, nan=0.0), S, c.patch)
-  mean = np.where(count >= c.sweep_views, cost / np.maximum(count, 1), np.inf)
-  best = np.argmin(mean, axis=2)
-  c0 = np.take_along_axis(mean, best[..., None], 2)[..., 0]
-  far = np.abs(np.arange(S)[None, None] - best[..., None]) > 2
-  c1 = np.min(np.where(far, mean, np.inf), axis=2)
-  cl = np.take_along_axis(mean, np.clip(best - 1, 0, S - 1)[..., None], 2)[..., 0]
-  cr = np.take_along_axis(mean, np.clip(best + 1, 0, S - 1)[..., None], 2)[..., 0]
-  interior = (best > 0) & (best < S - 1) & np.isfinite(c0)
-  with np.errstate(invalid='ignore'):
-    curv = np.where(interior, cl + cr - 2 * c0, 0)
-    offset = np.where(interior & (curv > 1e-6), 0.5 * (cl - cr) / np.maximum(curv, 1e-6), 0)
-  step = (hi_s - lo_s) / (S - 1)
-  ok = interior & (c0 < c.uniqueness * c1) & (curv > 0) & np.isfinite(step)
-  rho = np.where(ok, lo_s + (best + offset) * step, np.nan)
-  sig = np.where(ok, step / np.sqrt(np.maximum(curv, 1e-6)) * np.sqrt(np.maximum(c0, 1e-3)), np.nan)
+  lo_s = np.nan_to_num(cv2.resize(lo, (w, h), interpolation=cv2.INTER_NEAREST), nan=1.0)
+  hi_s = np.nan_to_num(cv2.resize(hi, (w, h), interpolation=cv2.INTER_NEAREST), nan=0.0)
+  rho, sig = plane_sweep(small(img), np.array([small(im) for im, _ in views]), Ks, rel[:, :3, :3].copy(),
+                         rel[:, :3, 3].copy(), lo_s, hi_s, c.samples, c.patch, c.step_px, c.sweep_views, c.uniqueness)
   return cv2.resize(rho, (W, H), interpolation=cv2.INTER_NEAREST), cv2.resize(sig, (W, H), interpolation=cv2.INTER_NEAREST)
 
 
@@ -239,13 +328,18 @@ def calibrate(rho, sig, uv, z):
   return max(1.0, float(np.median(np.abs(r[have] - 1 / z[ok][have]) / s[have])) / 0.6745)
 
 
-def depth_map(c, K, job, flow):
+def depth_map(c, K, job, flows):
   '''
   a keyframe's inverse depth and sigma (full resolution, NaN: none): DIS gives the wide valley (a prior: rho +- window
   sigma), the multi-baseline sweep pinpoints the minimum in it; where DIS has nothing the sweep searches the range of
   the keyframe's sparse points; inside a DIS window where the sweep finds nothing, DIS stands
   '''
-  rho, sig = dis(c, K, job.image, job.T, job.keyframes, flow)
+  if c.use_dis:
+    rho, sig = dis(c, K, job.image, job.T, job.keyframes, flows)
+  else:
+    rho = sig = np.full(job.image.shape, np.nan)
+  if not c.use_sweep:
+    return rho, sig * (calibrate(rho, sig, job.uv, job.z) if c.calibrate else 1.0)
   inv = 1 / job.z[job.z > 0]
   a, b = np.percentile(inv, 1) * 0.5, np.percentile(inv, 99) * 1.5
   have = np.isfinite(rho)
@@ -255,7 +349,7 @@ def depth_map(c, K, job, flow):
   out, s = sweep(c, K, job.image, job.T, job.views, lo, hi)
   out = np.where(np.isfinite(out), out, rho)
   s = np.where(np.isfinite(s), s, sig)
-  return out, s * calibrate(out, s, job.uv, job.z)
+  return out, s * (calibrate(out, s, job.uv, job.z) if c.calibrate else 1.0)
 
 
 # ------------------------------------------------------------------------------------------------- TSDF (voxel hashing)
@@ -326,7 +420,7 @@ def allocate(keys, rows, coords, n, K, T_wc, rho, trunc, voxel):
 
 
 @njit(cache=True, parallel=True, nogil=True)
-def integrate(coords, n, tsdf, weight, color, voxel, K, T_cw, rho, sig, img, trunc):
+def integrate(coords, n, tsdf, weight, color, voxel, K, T_cw, rho, sig, img, trunc, sigma_weights, carve):
   '''
   voxel-centric update of the blocks in the view: signed distance along the optical axis (truncated; free space in
   front sets +1), weighted by 1 / sigma_depth^2, nearest pixel
@@ -366,10 +460,10 @@ def integrate(coords, n, tsdf, weight, color, voxel, K, T_cw, rho, sig, img, tru
           if not r > 0:
             continue
           sdf = 1.0 / r - z
-          if sdf < -trunc:
+          if sdf < -trunc or (sdf > trunc and not carve):
             continue
           sd = sig[v, u] / (r * r)
-          wt = 1.0 / max(sd * sd, 1e-12)
+          wt = 1.0 / max(sd * sd, 1e-12) if sigma_weights else 1.0
           w0 = weight[b, i, j, k]
           tsdf[b, i, j, k] = (w0 * tsdf[b, i, j, k] + wt * min(sdf, trunc) / trunc) / (w0 + wt)
           if sdf < trunc:
@@ -432,8 +526,9 @@ def near_surface(keys, rows, tsdf, weight, voxel, min_weight, band, points):
 
 
 class TSDF:
-  def __init__(self, voxel, truncation):
+  def __init__(self, voxel, truncation, sigma_weights=True, carve=True, min_count=(3, 2)):
     self.voxel, self.trunc = voxel, truncation * voxel
+    self.sigma_weights, self.carve, self.min_count = sigma_weights, carve, min_count
     self.keys = np.full(1 << 16, -1, np.int64)
     self.rows = np.zeros(1 << 16, np.int64)
     self.coords = np.zeros((1 << 12, 3), np.int64)
@@ -467,22 +562,23 @@ class TSDF:
       self.grow()
     self.grow()
     integrate(self.coords, self.n, self.tsdf, self.weight, self.color, self.voxel, K, T_cw, rho,
-              np.nan_to_num(sig, nan=1.0), img, self.trunc)
+              np.nan_to_num(sig, nan=1.0), img, self.trunc, self.sigma_weights, self.carve)
 
-  def min_weight(self, sigma):
-    return 1 / (sigma * self.voxel) ** 2
+  def min_weight(self, sigma, count):
+    '''fused sigma below sigma [voxels] (weights 1 / sigma^2), or count observations (unit weights)'''
+    return 1 / (sigma * self.voxel) ** 2 if self.sigma_weights else count
 
   def surface(self, sigma):
     '''the zero crossings where the fused sigma is below sigma [voxels], and their colours'''
     args = (self.keys, self.rows, self.coords, self.n, self.tsdf, self.weight, self.color, self.voxel,
-            self.min_weight(sigma))
+            self.min_weight(sigma, self.min_count[0]))
     m = crossings(*args, None, None)
     pts, col = np.empty((m, 3)), np.empty((m, 3), np.uint8)
     crossings(*args, pts, col)
     return pts, col
 
   def near_surface(self, points, sigma, band):
-    return near_surface(self.keys, self.rows, self.tsdf, self.weight, self.voxel, self.min_weight(sigma), band,
+    return near_surface(self.keys, self.rows, self.tsdf, self.weight, self.voxel, self.min_weight(sigma, self.min_count[1]), band,
                         np.ascontiguousarray(points, np.float64))
 
   def mesh(self, sigma, max_voxels=200_000_000):
@@ -500,7 +596,7 @@ class TSDF:
     col = np.zeros(tuple(shape) + (3,), np.uint8)
     for b, (x, y, z) in enumerate((c - lo) * B):
       vol[x:x + B, y:y + B, z:z + B] = self.tsdf[b]
-      good[x:x + B, y:y + B, z:z + B] = self.weight[b] >= self.min_weight(sigma)
+      good[x:x + B, y:y + B, z:z + B] = self.weight[b] >= self.min_weight(sigma, self.min_count[0])
       col[x:x + B, y:y + B, z:z + B] = self.color[b]
     if not good.any():
       return None
@@ -632,8 +728,8 @@ class DenseMapper:
     self.records = {}             # keyframe -> Record (worker thread)
     self.tsdf = None
     self.timing = {'depth': 0.0, 'fuse': 0.0, 'refuse': 0.0, 'log': 0.0}
-    self.counts = {'maps': 0, 'refuse': 0}
-    self.flow = cv2.DISOpticalFlow_create(config.dis_preset)
+    self.counts = {'maps': 0, 'refuse': 0, 'skipped': 0}
+    self.flows = Flows(config.dis_preset, config.keyframes)
     self.queue = queue.Queue()
     self.error = None
     self.worker = threading.Thread(target=self.work, daemon=True) if threaded else None
@@ -678,10 +774,12 @@ class DenseMapper:
     due = [k for k in self.pending if m.kfs.frame[k] + c.delay <= f]
     for k in due:
       self.pending.remove(k)
-      if m.kfs.alive[k]:
-        self.submit(('map', self.job(slam, k, f)))
-      else:
+      if not m.kfs.alive[k]:
         self.kf_images.pop(k, None)
+      elif c.max_queue and self.worker is not None and self.queue.qsize() >= c.max_queue:
+        self.counts['skipped'] += 1           # (behind: its neighbours cover most of it)
+      else:
+        self.submit(('map', self.job(slam, k, f)))
 
   def job(self, slam, k, now, refine=False):
     '''the snapshot for keyframe k: its image and pose, covisible keyframes, frames around it, its sparse points'''
@@ -783,7 +881,7 @@ class DenseMapper:
       self.log(item[1], final=True)
 
   def record(self, job):
-    rho, sig = depth_map(self.c, self.K, job, self.flow)
+    rho, sig = depth_map(self.c, self.K, job, self.flows)
     h, w = rho.shape
     small = lambda a: a[::2, ::2][:h // 2, :w // 2].copy()
     color = self.load_color(job.frame)
@@ -800,7 +898,7 @@ class DenseMapper:
     self.timing['depth'] += time.perf_counter() - t
     t = time.perf_counter()
     if self.tsdf is None:
-      self.tsdf = TSDF(self.c.voxel * float(np.median(job.z[job.z > 0])), self.c.truncation)
+      self.tsdf = self.new_tsdf(self.c.voxel * float(np.median(job.z[job.z > 0])))
     self.records[job.kf] = r
     r.T, r.scale = job.T, 1.0
     self.tsdf.integrate(self.Kh, r.T, r.rho, r.sig, r.color)
@@ -819,7 +917,7 @@ class DenseMapper:
     t = time.perf_counter()
     if self.tsdf is None:
       return
-    self.tsdf = TSDF(self.tsdf.voxel, self.c.truncation)
+    self.tsdf = self.new_tsdf(self.tsdf.voxel)
     for r in self.records.values():
       r.T = r.T_rel @ kfs_T[r.ref]
       alive = state[r.pts] == MAPPED
@@ -836,6 +934,9 @@ class DenseMapper:
         for k, r in self.records.items():
           self.log_placement(k, r)
       self.log(now)
+
+  def new_tsdf(self, voxel):
+    return TSDF(voxel, self.c.truncation, self.c.sigma_weights, self.c.carve, self.c.min_count)
 
   def log_placement(self, k, r):
     T_wc = inv_pose(r.T)

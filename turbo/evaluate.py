@@ -166,9 +166,10 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
   dense mapping against ground-truth depth (depth: frame -> metres, 0 unknown, or None). Every keyframe map is scaled to
   metres by its sparse points against the ground truth (so SLAM scale drift is not counted as reconstruction error).
   Per keyframe (over the pixels with ground truth): completeness, acc10 (fraction of all within 10% in inverse depth),
-  precision (of the estimates within 10%), outliers (beyond 25%). 3D: the fused surface and the dense points against
-  the ground-truth cloud (every keyframe's ground truth placed like its map): precision (reconstruction -> ground
-  truth) and coverage (ground truth -> reconstruction) within the thresholds [m]
+  precision (of the estimates within 10%), outliers (beyond 25%); whether sigma is informative: the precision of the
+  more certain half (by relative sigma) and the rank correlation of sigma and error. 3D: the fused surface and the
+  dense points against the ground-truth cloud (every keyframe's ground truth placed like its map): precision
+  (reconstruction -> ground truth) and coverage (ground truth -> reconstruction) within the thresholds [m]
   '''
   import scipy.spatial
   from dense import backproject
@@ -189,8 +190,13 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
     est = valid & np.isfinite(r.rho) & (r.rho > 0)
     err = np.abs(r.rho[est] / sc - 1 / gt[est]) * gt[est]
     n = max(valid.sum(), 1)
+    # is sigma informative: precision of the more certain half (relative sigma), rank correlation sigma ~ error
+    rel_sig = r.sig[est] / r.rho[est]
+    certain = rel_sig <= np.median(rel_sig) if est.any() else est[est]
+    rank = lambda x: np.argsort(np.argsort(x))
     rows.append([est.sum() / n, (err < 0.1).sum() / n, np.mean(err < 0.1) if est.any() else np.nan,
-                 np.mean(err > 0.25) if est.any() else np.nan])
+                 np.mean(err > 0.25) if est.any() else np.nan, np.mean(err[certain] < 0.1) if est.any() else np.nan,
+                 np.corrcoef(rank(rel_sig), rank(err))[0, 1] if est.sum() > 10 else np.nan])
     X, _ = backproject(mapper.Kh, r.T, np.where(valid, sc / (np.where(valid, gt, 1) * r.scale), np.nan), step)
     gt_pts.append(X)
     mpu.append(sc / r.scale)
@@ -198,7 +204,8 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
     return {}
   rows = np.array(rows)
   out = {'keyframes': len(rows), 'completeness': float(np.mean(rows[:, 0])), 'acc10': float(np.mean(rows[:, 1])),
-         'precision': float(np.nanmean(rows[:, 2])), 'outliers': float(np.nanmean(rows[:, 3]))}
+         'precision': float(np.nanmean(rows[:, 2])), 'outliers': float(np.nanmean(rows[:, 3])),
+         'precision_certain_half': float(np.nanmean(rows[:, 4])), 'sigma_error_rank_corr': float(np.nanmean(rows[:, 5]))}
   gt_pts = np.concatenate(gt_pts)
   m = float(np.median(mpu))
   tree = scipy.spatial.cKDTree(gt_pts)
