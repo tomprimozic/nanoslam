@@ -367,7 +367,7 @@ def main():
   parser.add_argument('--gt', action='store_true', help='rerun: show the ground truth (aligned to the map)')
   parser.add_argument('--dense', action='store_true', help='live dense mapping (dense.py)')
   parser.add_argument('--realtime', action='store_true',
-                      help="frames at the camera's rate; dense mapping skips keyframes when behind (dense.max_queue=2)")
+                      help="frames at the camera's rate; dense mapping skips keyframes when behind (dense.max_queue=10)")
   parser.add_argument('--quiet', action='store_true')
   parser.add_argument('--trajectory', default='online', help="summary: 'online' (live poses) or 'final' (hindsight)")
   parser.add_argument('--perturb', type=int, help='perturb all numeric parameters randomly (seed)')
@@ -388,7 +388,7 @@ def main():
     return summary([str(args.out)])
   faulthandler.enable()
   rr = setup_rerun(args.rerun_save) if args.rerun or args.rerun_save else None
-  config, dense_config = make_config((['dense.max_queue=2'] if args.realtime else []) + args.set)
+  config, dense_config = make_config((['dense.max_queue=10'] if args.realtime else []) + args.set)
   r = run(args.dataset, config, args.out, args.start, args.max_frames, rr, dense_config=dense_config if args.dense else None,
           show_gt=args.gt, realtime=args.realtime)
   print(format_result(r))
