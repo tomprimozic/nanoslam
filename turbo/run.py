@@ -114,6 +114,8 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False, 
   slam.finish()
   elapsed = time.perf_counter() - t0
   if mapper is not None:
+    if not quiet and mapper.queued_maps:
+      print(f'{name}: dense mapping is {mapper.queued_maps} keyframes behind, finishing (--realtime skips instead)', flush=True)
     t = time.perf_counter()
     mapper.finish(slam)
     dense_wait = time.perf_counter() - t
@@ -136,8 +138,11 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False, 
     'latency_ms': {'mean': 1e3 * np.mean(latency), 'p99': 1e3 * np.percentile(latency, 99), 'max': 1e3 * np.max(latency)},
   }
   if mapper is not None:
-    result['dense'] = evaluate.dense(mapper, lambda f: data.depth(f + start)) | {
-      'timing': mapper.timing, 'counts': mapper.counts, 'wait_after_slam_s': dense_wait}
+    result['dense'] = {'timing': mapper.timing, 'counts': mapper.counts, 'wait_after_slam_s': dense_wait}
+    if out is not None:       # (against ground-truth depth: minutes on long sequences, so only when saving a run)
+      if not quiet:
+        print(f'{name}: evaluating the dense map against ground-truth depth', flush=True)
+      result['dense'] |= evaluate.dense(mapper, lambda f: data.depth(f + start))
   if out is not None:
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / 'trajectory.npz', final=T_final[:, :3, 3], online=T_online[:, :3, 3], gt=gt, poses=T_final,

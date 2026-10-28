@@ -170,7 +170,7 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
   more certain half (by relative sigma) and the rank correlation of sigma and error. 3D: the fused surface and the
   dense points against the ground-truth cloud (every keyframe's ground truth placed like its map): precision
   (reconstruction -> ground truth) and coverage (ground truth -> reconstruction) within the thresholds [m]; the
-  surface and the points also over a range of certainty thresholds (*_curve: precision 2 / 5 cm, coverage 2 / 5 cm)
+  surface also over a range of certainty thresholds (surface_curve: precision 2 / 5 cm, coverage 2 / 5 cm)
   '''
   import scipy.spatial
   from dense import backproject
@@ -212,8 +212,8 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
   m = float(np.median(mpu))
   tree = scipy.spatial.cKDTree(gt_pts)
   def score(P):
-    d_acc = tree.query(P)[0] * m
-    d_cov = scipy.spatial.cKDTree(P).query(gt_pts)[0] * m
+    d_acc = tree.query(P, workers=-1)[0] * m
+    d_cov = scipy.spatial.cKDTree(P).query(gt_pts, workers=-1)[0] * m
     return [float(np.mean(d < t)) for d in (d_acc, d_cov) for t in thresholds]
   for name, (P, _) in [('surface', mapper.surface()), ('points', mapper.dense_points())]:
     if len(P) == 0:
@@ -229,6 +229,4 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
   levels = ([1 / (s * ts.voxel) ** 2 for s in (0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0)] if ts.sigma_weights
             else [1, 2, 3, 4, 6, 8, 12, 16, 24])
   out['surface_curve'] = [score(P) for w in levels if len(P := ts.surface(min_weight=w)[0]) > 0]
-  levels = [1 / (s * ts.voxel) ** 2 for s in (0.5, 1.0, 2.0)] if ts.sigma_weights else [1, 2, 4]
-  out['points_curve'] = [score(P) for w in levels if len(P := mapper.dense_points(min_weight=w)[0]) > 0]
   return out
