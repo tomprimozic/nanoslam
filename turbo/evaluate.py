@@ -169,7 +169,8 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
   precision (of the estimates within 10%), outliers (beyond 25%); whether sigma is informative: the precision of the
   more certain half (by relative sigma) and the rank correlation of sigma and error. 3D: the fused surface and the
   dense points against the ground-truth cloud (every keyframe's ground truth placed like its map): precision
-  (reconstruction -> ground truth) and coverage (ground truth -> reconstruction) within the thresholds [m]
+  (reconstruction -> ground truth) and coverage (ground truth -> reconstruction) within the thresholds [m]; the
+  surface and the points also over a range of certainty thresholds (*_curve: precision 2 / 5 cm, coverage 2 / 5 cm)
   '''
   import scipy.spatial
   from dense import backproject
@@ -205,17 +206,29 @@ def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
   rows = np.array(rows)
   out = {'keyframes': len(rows), 'completeness': float(np.mean(rows[:, 0])), 'acc10': float(np.mean(rows[:, 1])),
          'precision': float(np.nanmean(rows[:, 2])), 'outliers': float(np.nanmean(rows[:, 3])),
-         'precision_certain_half': float(np.nanmean(rows[:, 4])), 'sigma_error_rank_corr': float(np.nanmean(rows[:, 5]))}
+         'precision_certain_half': float(np.nanmean(rows[:, 4])),
+         'sigma_error_rank_corr': float(np.nanmean(rows[:, 5]))}
   gt_pts = np.concatenate(gt_pts)
   m = float(np.median(mpu))
   tree = scipy.spatial.cKDTree(gt_pts)
+  def score(P):
+    d_acc = tree.query(P)[0] * m
+    d_cov = scipy.spatial.cKDTree(P).query(gt_pts)[0] * m
+    return [float(np.mean(d < t)) for d in (d_acc, d_cov) for t in thresholds]
   for name, (P, _) in [('surface', mapper.surface()), ('points', mapper.dense_points())]:
     if len(P) == 0:
       continue
-    d_acc = tree.query(P)[0] * m
-    d_cov = scipy.spatial.cKDTree(P).query(gt_pts)[0] * m
     out[f'{name}_n'] = len(P)
-    for t in thresholds:
-      out[f'{name}_precision_{int(100 * t)}cm'] = float(np.mean(d_acc < t))
-      out[f'{name}_coverage_{int(100 * t)}cm'] = float(np.mean(d_cov < t))
+    s = score(P)
+    for i, t in enumerate(thresholds):
+      out[f'{name}_precision_{int(100 * t)}cm'] = s[i]
+      out[f'{name}_coverage_{int(100 * t)}cm'] = s[len(thresholds) + i]
+  # the surface's precision / coverage curve over the certainty threshold (fused sigma, or observations with unit
+  # weights): changes that rescale sigma move along it, so compare at equal coverage
+  ts = mapper.tsdf
+  levels = ([1 / (s * ts.voxel) ** 2 for s in (0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0)] if ts.sigma_weights
+            else [1, 2, 3, 4, 6, 8, 12, 16, 24])
+  out['surface_curve'] = [score(P) for w in levels if len(P := ts.surface(min_weight=w)[0]) > 0]
+  levels = [1 / (s * ts.voxel) ** 2 for s in (0.5, 1.0, 2.0)] if ts.sigma_weights else [1, 2, 4]
+  out['points_curve'] = [score(P) for w in levels if len(P := mapper.dense_points(min_weight=w)[0]) > 0]
   return out

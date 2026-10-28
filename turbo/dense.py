@@ -31,9 +31,9 @@ from map import MAPPED
 
 class DenseConfig:
   keyframes = 6                     # covisible keyframes (DIS flow and the sweep)
-  frames_before = (1, 2, 4, 8, 16, 32)    # frame offsets before / after the keyframe in the sweep (small baselines)
-  frames_after = (1, 2, 4, 8, 16, 32)
-  delay = 32                        # frames after a keyframe before its depth map is computed
+  frames_before = (1, 4, 16)        # frame offsets before / after the keyframe in the sweep (small baselines; with
+  frames_after = (1, 4, 16)         # 1, 2, 4, 8, 16, 32: the same maps after fusion, 1.3x slower)
+  delay = 16                        # frames after a keyframe before its depth map is computed
   # DIS
   dis_preset = 2                    # cv2.DISOPTICAL_FLOW_PRESET_ (0 ultrafast, 1 fast, 2 medium)
   fb_px = 1.0                       # forward-backward consistency
@@ -134,13 +134,14 @@ def fuse_hypotheses(rho, sig, min_views, chi2):
   out, out_sig = np.full((h, w), np.nan), np.full((h, w), np.nan)
   for v in prange(h):
     for u in range(w):
+      r, s = rho[:, v, u], sig[:, v, u]
       best, seed = 0, -1
       for i in range(N):
-        if not np.isfinite(rho[i, v, u]):
+        if not np.isfinite(r[i]):
           continue
         n = 0
         for j in range(N):
-          if np.isfinite(rho[j, v, u]) and (rho[i, v, u] - rho[j, v, u]) ** 2 < chi2 * (sig[i, v, u] ** 2 + sig[j, v, u] ** 2):
+          if np.isfinite(r[j]) and (r[i] - r[j]) ** 2 < chi2 * (s[i] ** 2 + s[j] ** 2):
             n += 1
         if n > best:
           best, seed = n, i
@@ -148,10 +149,10 @@ def fuse_hypotheses(rho, sig, min_views, chi2):
         continue
       sw, swr = 0.0, 0.0
       for j in range(N):
-        if np.isfinite(rho[j, v, u]) and (rho[seed, v, u] - rho[j, v, u]) ** 2 < chi2 * (sig[seed, v, u] ** 2 + sig[j, v, u] ** 2):
-          wj = 1.0 / sig[j, v, u] ** 2
+        if np.isfinite(r[j]) and (r[seed] - r[j]) ** 2 < chi2 * (s[seed] ** 2 + s[j] ** 2):
+          wj = 1.0 / s[j] ** 2
           sw += wj
-          swr += wj * rho[j, v, u]
+          swr += wj * r[j]
       out[v, u] = swr / sw
       out_sig[v, u] = 1.0 / np.sqrt(sw)
   return out, out_sig
@@ -190,7 +191,18 @@ def dis(c, K, img, T, keyframes, flows):
   return fuse_hypotheses(rho, sig, c.min_views, 5.99 if c.chi2_test else np.inf)
 
 
-@njit(cache=True, parallel=True, nogil=True, fastmath={'nsz', 'arcp', 'contract', 'afn', 'reassoc'})   # (no nnan / ninf: infs mark samples)
+@njit(cache=True, nogil=True)
+def epipolar(K, R, t, x0, x1):
+  '''the projection of the ray through normalized (x0, x1) at inverse depth rho: (A + rho B) / (A2 + rho B2)'''
+  r0 = R[0, 0] * x0 + R[0, 1] * x1 + R[0, 2]
+  r1 = R[1, 0] * x0 + R[1, 1] * x1 + R[1, 2]
+  r2 = R[2, 0] * x0 + R[2, 1] * x1 + R[2, 2]
+  return (K[0, 0] * r0 + K[0, 2] * r2, K[1, 1] * r1 + K[1, 2] * r2, r2,
+          K[0, 0] * t[0] + K[0, 2] * t[2], K[1, 1] * t[1] + K[1, 2] * t[2], t[2])
+
+
+# (fastmath without nnan / ninf: infinite costs mark invalid samples)
+@njit(cache=True, parallel=True, nogil=True, fastmath={'nsz', 'arcp', 'contract', 'afn', 'reassoc'})
 def plane_sweep(ref, others, K, R, t, lo, hi, S, half, step_px, min_views, uniqueness):
   '''
   per reference pixel, inverse-depth samples in [lo, hi] (about step_px apart along the longest epipolar segment, at
@@ -224,12 +236,7 @@ def plane_sweep(ref, others, K, R, t, lo, hi, S, half, step_px, min_views, uniqu
       x1 = (v - K[1, 2]) / K[1, 1]
       span = 0.0
       for f in range(F):
-        A0 = K[0, 0] * (R[f, 0, 0] * x0 + R[f, 0, 1] * x1 + R[f, 0, 2]) + K[0, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
-        A1 = K[1, 1] * (R[f, 1, 0] * x0 + R[f, 1, 1] * x1 + R[f, 1, 2]) + K[1, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
-        A2 = R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2]
-        B0 = K[0, 0] * t[f, 0] + K[0, 2] * t[f, 2]
-        B1 = K[1, 1] * t[f, 1] + K[1, 2] * t[f, 2]
-        B2 = t[f, 2]
+        A0, A1, A2, B0, B1, B2 = epipolar(K, R[f], t[f], x0, x1)
         z0, z1 = A2 + lo[v, u] * B2, A2 + hi[v, u] * B2
         if z0 > 1e-6 and z1 > 1e-6:
           du = (A0 + lo[v, u] * B0) / z0 - (A0 + hi[v, u] * B0) / z1
@@ -240,13 +247,7 @@ def plane_sweep(ref, others, K, R, t, lo, hi, S, half, step_px, min_views, uniqu
       cost[:Sp] = 0.0
       count[:Sp] = 0
       for f in range(F):
-        # p(rho) = K (R x + rho t) / z = (A + rho B) / (A2 + rho B2)
-        A0 = K[0, 0] * (R[f, 0, 0] * x0 + R[f, 0, 1] * x1 + R[f, 0, 2]) + K[0, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
-        A1 = K[1, 1] * (R[f, 1, 0] * x0 + R[f, 1, 1] * x1 + R[f, 1, 2]) + K[1, 2] * (R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2])
-        A2 = R[f, 2, 0] * x0 + R[f, 2, 1] * x1 + R[f, 2, 2]
-        B0 = K[0, 0] * t[f, 0] + K[0, 2] * t[f, 2]
-        B1 = K[1, 1] * t[f, 1] + K[1, 2] * t[f, 2]
-        B2 = t[f, 2]
+        A0, A1, A2, B0, B1, B2 = epipolar(K, R[f], t[f], x0, x1)
         for s in range(Sp):
           rs = lo[v, u] + s * step
           z = A2 + rs * B2
@@ -310,7 +311,8 @@ def sweep(c, K, img, T, views, lo, hi):
   hi_s = np.nan_to_num(cv2.resize(hi, (w, h), interpolation=cv2.INTER_NEAREST), nan=0.0)
   rho, sig = plane_sweep(small(img), np.array([small(im) for im, _ in views]), Ks, rel[:, :3, :3].copy(),
                          rel[:, :3, 3].copy(), lo_s, hi_s, c.samples, c.patch, c.step_px, c.sweep_views, c.uniqueness)
-  return cv2.resize(rho, (W, H), interpolation=cv2.INTER_NEAREST), cv2.resize(sig, (W, H), interpolation=cv2.INTER_NEAREST)
+  full = lambda a: cv2.resize(a, (W, H), interpolation=cv2.INTER_NEAREST)
+  return full(rho), full(sig)
 
 
 def calibrate(rho, sig, uv, z):
@@ -468,7 +470,8 @@ def integrate(coords, n, tsdf, weight, color, voxel, K, T_cw, rho, sig, img, tru
           tsdf[b, i, j, k] = (w0 * tsdf[b, i, j, k] + wt * min(sdf, trunc) / trunc) / (w0 + wt)
           if sdf < trunc:
             for ch in range(3):
-              color[b, i, j, k, ch] = np.uint8(min(255.0, (w0 * color[b, i, j, k, ch] + wt * img[v, u, ch]) / (w0 + wt) + 0.5))
+              c = (w0 * color[b, i, j, k, ch] + wt * img[v, u, ch]) / (w0 + wt)
+              color[b, i, j, k, ch] = np.uint8(min(255.0, c + 0.5))
           weight[b, i, j, k] = w0 + wt
 
 
@@ -568,17 +571,18 @@ class TSDF:
     '''fused sigma below sigma [voxels] (weights 1 / sigma^2), or count observations (unit weights)'''
     return 1 / (sigma * self.voxel) ** 2 if self.sigma_weights else count
 
-  def surface(self, sigma):
-    '''the zero crossings where the fused sigma is below sigma [voxels], and their colours'''
+  def surface(self, sigma=None, min_weight=None):
+    '''the zero crossings where the fused sigma is below sigma [voxels] (or the weight above min_weight), colours'''
     args = (self.keys, self.rows, self.coords, self.n, self.tsdf, self.weight, self.color, self.voxel,
-            self.min_weight(sigma, self.min_count[0]))
+            self.min_weight(sigma, self.min_count[0]) if min_weight is None else min_weight)
     m = crossings(*args, None, None)
     pts, col = np.empty((m, 3)), np.empty((m, 3), np.uint8)
     crossings(*args, pts, col)
     return pts, col
 
-  def near_surface(self, points, sigma, band):
-    return near_surface(self.keys, self.rows, self.tsdf, self.weight, self.voxel, self.min_weight(sigma, self.min_count[1]), band,
+  def near_surface(self, points, sigma, band, min_weight=None):
+    w = self.min_weight(sigma, self.min_count[1]) if min_weight is None else min_weight
+    return near_surface(self.keys, self.rows, self.tsdf, self.weight, self.voxel, w, band,
                         np.ascontiguousarray(points, np.float64))
 
   def mesh(self, sigma, max_voxels=200_000_000):
@@ -731,6 +735,9 @@ class DenseMapper:
     self.counts = {'maps': 0, 'refuse': 0, 'skipped': 0}
     self.flows = Flows(config.dis_preset, config.keyframes)
     self.queue = queue.Queue()
+    self.pending_lock = threading.Lock()
+    self.queued_maps = 0              # maps waiting in the queue (real time: skip beyond max_queue)
+    self.next_refuse = None           # the waiting re-fusion (coalesced: the newest placements)
     self.error = None
     self.worker = threading.Thread(target=self.work, daemon=True) if threaded else None
     if self.worker is not None:
@@ -776,7 +783,7 @@ class DenseMapper:
       self.pending.remove(k)
       if not m.kfs.alive[k]:
         self.kf_images.pop(k, None)
-      elif c.max_queue and self.worker is not None and self.queue.qsize() >= c.max_queue:
+      elif c.max_queue and self.worker is not None and self.queued_maps >= c.max_queue:
         self.counts['skipped'] += 1           # (behind: its neighbours cover most of it)
       else:
         self.submit(('map', self.job(slam, k, f)))
@@ -821,8 +828,15 @@ class DenseMapper:
   def submit(self, item):
     if self.worker is None:
       self.process(item)
-    else:
-      self.queue.put(item)
+      return
+    with self.pending_lock:
+      if item[0] == 'map':
+        self.queued_maps += 1
+      if item[0] == 'refuse':        # (one waiting re-fusion is enough: it takes the newest placements)
+        queued, self.next_refuse = self.next_refuse is not None, item
+        if queued:
+          return
+    self.queue.put(item)
 
   def finish(self, slam):
     '''the keyframes still waiting (with the frames there are), optionally refine, wait for the worker'''
@@ -860,6 +874,8 @@ class DenseMapper:
   def process(self, item):
     kind = item[0]
     if kind == 'map':
+      with self.pending_lock:
+        self.queued_maps -= self.worker is not None
       self.map_keyframe(item[1])
     elif kind == 'cull':
       _, k, parent, T_k, T_p = item
@@ -867,6 +883,9 @@ class DenseMapper:
         if r.ref == k:
           r.T_rel, r.ref = r.T_rel @ T_k @ inv_pose(T_p), parent
     elif kind == 'refuse':
+      if self.worker is not None:
+        with self.pending_lock:
+          item, self.next_refuse = self.next_refuse, None
       self.refuse(*item[1:])
     elif kind == 'refine':
       _, jobs, kfs_T, X, state = item
@@ -940,7 +959,8 @@ class DenseMapper:
 
   def log_placement(self, k, r):
     T_wc = inv_pose(r.T)
-    self.rr.log(f'world/map/dense/keyframes/{k}', self.rr.Transform3D(translation=T_wc[:3, 3], mat3x3=r.scale * T_wc[:3, :3]))
+    self.rr.log(f'world/map/dense/keyframes/{k}',
+                self.rr.Transform3D(translation=T_wc[:3, 3], mat3x3=r.scale * T_wc[:3, :3]))
 
   # --- outputs
 
@@ -950,7 +970,7 @@ class DenseMapper:
       return np.zeros((0, 3)), np.zeros((0, 3), np.uint8)
     return self.tsdf.surface(self.c.surface_sigma)
 
-  def dense_points(self, step=None):
+  def dense_points(self, step=None, min_weight=None):
     '''every keyframe's raw points next to a confident fused surface, and their colours (map frame)'''
     step = step or self.c.points_step // 2
     P, C = [np.zeros((0, 3))], [np.zeros((0, 3), np.uint8)]
@@ -958,7 +978,7 @@ class DenseMapper:
       return P[0], C[0]
     for r in self.records.values():
       X, col = backproject(self.Kh, r.T, r.rho / r.scale, step, r.color)
-      keep = self.tsdf.near_surface(X, self.c.points_sigma, self.c.points_band)
+      keep = self.tsdf.near_surface(X, self.c.points_sigma, self.c.points_band, min_weight)
       P.append(X[keep])
       C.append(col[keep])
     return np.concatenate(P), np.concatenate(C)

@@ -9,7 +9,8 @@ cd turbo
 ../.venv/bin/python run.py household                     # one sequence (names: datasets.py / run.py all)
 ../.venv/bin/python run.py household --rerun             # with visualization (--rerun-save x.rrd: to a file)
 ../.venv/bin/python run.py household --dense --rerun     # + live dense mapping (--gt: ground truth in the view)
-../.venv/bin/python run.py household --dense --set dense.mesh=True dense.cube=4 dense.delay=16   # DenseConfig values
+../.venv/bin/python run.py household --dense --realtime   # frames at the camera's rate (dense skips keyframes if behind)
+../.venv/bin/python run.py household --dense --set dense.mesh=True dense.cube=4   # DenseConfig values
 ../.venv/bin/python run.py all --out runs/NAME            # all sequences in parallel, then a summary table
 ../.venv/bin/python run.py all --out runs/NAME --starts 0,7,14            # ensemble over start frames (use this!)
 ../.venv/bin/python run.py all --out runs/X --set loop=False final_ba_iters=0   # override any Config value
@@ -163,19 +164,20 @@ camera orientations: cameras are held without roll, so their x axes span the hor
 (keyframe and frame poses, covisibility, the keyframes' map points) and never writes to it; the work runs in a worker
 thread on snapshots, in order, so results do not depend on timing.
 
-Per keyframe, once `delay` (32) frames after it have arrived:
+Per keyframe, once `delay` (16) frames after it have arrived:
 
-1. **DIS flow** (OpenCV, medium preset) forward and backward to the 6 most covisible keyframes, triangulated with the
-   known poses (closed form: the projection is linear in inverse depth). Matches are dropped beyond 1 px of
-   forward-backward error or 1.5 px from the epipolar line; sigma = max(0.3 px, forward-backward error) / |d pixel / d
-   inverse depth| (small baselines get a large sigma by themselves). The hypotheses are fused per pixel by the largest
-   chi2-compatible set (ORB-SLAM semi-dense, Mur-Artal & Tardos 2015), at least 2 keyframes agreeing.
-2. **Multi-baseline sweep** (Okutomi & Kanade): ZNCC (5x5, half resolution) over the frames at +-1, 2, 4, 8, 16, 32
-   from the keyframe (tracked frames, not only keyframes) and the covisible keyframes, the costs *summed* over all of
-   them as a function of inverse depth: small baselines give one wide valley, large ones a sharp minimum among false
-   ones, the sum a single sharp valley. Searched within +-3 sigma of DIS (32 samples), over the range of the
-   keyframe's map points where DIS has nothing; uniqueness (best < 0.8x the best 3+ samples away), parabola refinement,
-   sigma from the curvature. Where the sweep finds nothing inside a DIS window, DIS stands.
+1. **DIS flow** (OpenCV, medium preset) forward and backward to the 6 most covisible keyframes (in parallel threads),
+   triangulated with the known poses (closed form: the projection is linear in inverse depth). Matches are dropped
+   beyond 1 px of forward-backward error or 1.5 px from the epipolar line; sigma = max(0.3 px, forward-backward error)
+   / |d pixel / d inverse depth| (small baselines get a large sigma by themselves). The hypotheses are fused per pixel
+   by the largest chi2-compatible set (ORB-SLAM semi-dense, Mur-Artal & Tardos 2015), at least 2 keyframes agreeing.
+2. **Multi-baseline sweep** (Okutomi & Kanade): ZNCC (5x5, half resolution) over the frames at +-1, 4, 16 from the
+   keyframe (tracked frames, not only keyframes) and the covisible keyframes, the costs *summed* over all of them as
+   a function of inverse depth: small baselines give one wide valley, large ones a sharp minimum among false ones, the
+   sum a single sharp valley. Searched within +-3 sigma of DIS, over the range of the keyframe's map points where DIS
+   has nothing; samples about 0.5 px apart along the longest epipolar segment (at most 32); uniqueness (best < 0.8x
+   the best 3+ samples away), parabola refinement, sigma from the curvature. Where the sweep finds nothing inside a
+   DIS window, DIS stands.
 3. **Sigma calibration**: scaled up so that the errors at the keyframe's map points (BA depths, far more precise)
    have the median |z| of a Gaussian (raw sigmas are ~2x optimistic).
 4. **Fusion** into a TSDF with voxel hashing (8^3 blocks allocated along the rays around each depth; voxel = 1% of the
@@ -183,7 +185,7 @@ Per keyframe, once `delay` (32) frames after it have arrived:
    front of a surface carves floaters away), every observation weighted by 1 / sigma_depth^2 (Sigma-Fusion): the
    accumulated weight is the fused uncertainty.
 
-Outputs: the *surface* (zero crossings where the fused sigma is below half a voxel) and the *dense points* (every
+Outputs: the *surface* (zero crossings where the fused sigma is below 0.3 voxel) and the *dense points* (every
 keyframe's raw points within half a voxel of a surface with a fused sigma below a voxel: fusion decides what is
 trustworthy, the points keep the detail), optionally a mesh (marching cubes, `dense.mesh=True`) and a voxel map
 (`dense.cube=4`: cubes of 4 voxels aligned with up, holes in the floor layer closed). Depth maps are kept (half
@@ -191,26 +193,55 @@ resolution); after a loop closure or map merge they are fused again at the corre
 their own map points' distances; culled keyframes' maps are re-expressed relative to the parent. `dense.refine=True`
 recomputes every map at the end with all frames and keyframes (no gain on fr1/room, twice the work).
 
+**Speed**: ~0.11 s per keyframe (DIS ~45 ms with the 6 flows in parallel, sweep ~60 ms, fusion ~15 ms; numba on 6
+performance cores of an Apple M-series laptop; re-fusing after a loop ~2 s). `--realtime` plays the frames at the
+camera's rate and skips a keyframe when 10 maps are already waiting (`dense.max_queue`): household, fr2/desk and the
+EuRoC rooms keep up (0-16 of 330-510 keyframes skipped, same maps); fr1/room (a keyframe every 3 frames: fast
+handheld motion) and abandonedfactory skip 78 / 28. `dense.frames_before=() dense.frames_after=()` (keyframes only
+in the sweep) is ~0.08 s with the same fused maps.
+
 Evaluation (`evaluate.dense`, ground truth only here): per keyframe against ground-truth depth (TUM: Kinect, EuRoC:
 the laser scan rendered, TartanAir: rendered), each map scaled to metres by its own map points: *completeness*,
 *acc10* (fraction of all pixels within 10% in inverse depth), *precision* (of the estimates); in 3D the dense points
 against the ground-truth cloud: *precision* (reconstruction -> ground truth) and *coverage* (ground truth ->
-reconstruction) within 2 / 5 cm.
+reconstruction) within 2 / 5 cm. The surface depends on its certainty threshold (anything that rescales sigma moves
+along one precision / coverage curve), so variants are compared on it at equal coverage (`surface_curve`).
 
-Live (`--dense`, default settings; 0.5-0.6 s per keyframe, the SLAM runs ~10x faster, so the dense map finishes
-2-5 min after the SLAM on these sequences):
+Default settings (`--dense`; `--realtime`: dense points coverage 2 / 5 cm in brackets where it differs):
 
-| sequence | keyframes | per keyframe: completeness / acc10 / precision | dense points: precision 2 / 5 cm | coverage 2 / 5 cm | surface: precision 2 / 5 cm | coverage 2 / 5 cm |
+| sequence | keyframes mapped | per keyframe: completeness / acc10 / precision | dense points: precision 2 / 5 cm | coverage 2 / 5 cm | surface: precision 2 / 5 cm | coverage 2 / 5 cm |
 |---|---|---|---|---|---|---|
-| fr3/household (3 loops) | 372 | 0.78 / 0.69 / 0.89 | 0.90 / 0.98 | 0.77 / 0.85 | 0.77 / 0.94 | 0.47 / 0.74 |
-| fr2/desk | 303 | 0.92 / 0.84 / 0.91 | 0.97 / 1.00 | 0.87 / 0.91 | 0.94 / 0.99 | 0.61 / 0.85 |
-| fr1/room (4 loops, 2 map merges) | 308 | 0.75 / 0.61 / 0.79 | 0.94 / 0.99 | 0.54 / 0.63 | 0.93 / 0.99 | 0.38 / 0.49 |
-| V1_01 (laser scan) | 491 | 0.88 / 0.70 / 0.79 | 0.73 / 0.88 | 0.34 / 0.58 | 0.52 / 0.76 | 0.13 / 0.33 |
-| abandonedfactory (metres-scale scene) | 202 | 0.80 / 0.73 / 0.91 | 0.59 / 0.87 | 0.56 / 0.75 | 0.31 / 0.71 | 0.38 / 0.67 |
+| fr3/household (3 loops) | 391 | 0.78 / 0.68 / 0.88 | 0.89 / 0.97 | 0.79 / 0.87 (0.78 / 0.87) | 0.73 / 0.91 | 0.48 / 0.75 |
+| fr2/desk | 336 | 0.91 / 0.83 / 0.91 | 0.95 / 0.99 | 0.88 / 0.92 | 0.91 / 0.99 | 0.62 / 0.86 |
+| fr1/room (4 loops, 2 map merges) | 329 | 0.75 / 0.60 / 0.76 | 0.90 / 0.98 | 0.55 / 0.67 (0.45 / 0.59) | 0.88 / 0.99 | 0.36 / 0.49 |
+| V1_01 (laser scan) | 511 | 0.88 / 0.69 / 0.78 | 0.73 / 0.88 | 0.37 / 0.62 | 0.63 / 0.84 | 0.12 / 0.32 |
+| V2_01 (laser scan) | 331 | 0.83 / 0.71 / 0.86 | 0.74 / 0.95 | 0.58 / 0.80 | 0.76 / 0.98 | 0.20 / 0.46 |
+| abandonedfactory (metres-scale scene) | 202 | 0.81 / 0.73 / 0.91 | 0.60 / 0.88 | 0.56 / 0.75 (0.52 / 0.72) | 0.49 / 0.86 | 0.35 / 0.60 |
 
-On the first 600 household frames the live mapper matches the offline pipeline it replaced (dense points 0.82 / 0.96
-vs 0.83 / 0.97, coverage 0.73 / 0.83 vs 0.75 / 0.83). V1_01's far end of the room is only seen from 3-5 m: its
-walls stay fragmentary.
+V1_01's far end of the room is only seen from 3-5 m: its walls stay fragmentary.
+
+**Ablation** (each switch alone, mean over the 6 sequences above; previous defaults: sweep offsets +-1, 2, 4, 8, 16, 32,
+delay 32; the SLAM is deterministic and dense only reads it, so these are noise-free comparisons; surface: precision
+5 cm minus the full system's, at equal coverage):
+
+| variant | ms / keyframe | per keyframe: completeness / acc10 / precision | dense points: precision 2 / 5 cm | coverage 2 / 5 cm | surface | |
+|---|---|---|---|---|---|---|
+| full system | 147 | 0.83 / 0.72 / 0.86 | 0.81 / 0.94 | 0.62 / 0.77 | 0 | |
+| no DIS (the sweep searches the whole range, 64 samples) | 260 | 0.67 / 0.60 / 0.88 | 0.86 / 0.97 | 0.50 / 0.63 | -0.004 | DIS buys coverage (and speed) |
+| no sweep (DIS only) | 53 | 0.66 / 0.59 / 0.89 | 0.82 / 0.95 | 0.56 / 0.70 | -0.012 | the sweep buys coverage; DIS alone is a fast mode |
+| no chi2 test (DIS hypotheses averaged) | 145 | 0.84 / 0.72 / 0.85 | 0.80 / 0.94 | 0.62 / 0.78 | -0.007 | no effect after fusion |
+| 1 agreeing keyframe instead of 2 | 141 | 0.89 / 0.75 / 0.83 | 0.79 / 0.93 | 0.63 / 0.78 | +0.001 | no effect after fusion |
+| no sigma calibration | 147 | (same) | 0.80 / 0.94 | 0.63 / 0.78 | -0.004 | no effect (a per-keyframe scale) |
+| unit weights (KinectFusion) instead of 1 / sigma^2 | 146 | (same) | 0.75 / 0.90 | 0.64 / 0.82 | **-0.156** | sigma-fusion matters where depth varies: abandonedfactory 0.98 vs 0.20, V2_01 0.93 vs 0.87, fr2/desk 0.96 vs ~0.7; neutral to slightly worse on household / fr1/room / V1_01 |
+| no free-space carving | 145 | (same) | 0.79 / 0.93 | 0.64 / 0.79 | +0.007 | no effect on these metrics |
+| sweep on keyframes only (no frames between) | 83 | 0.81 / 0.70 / 0.85 | 0.81 / 0.95 | 0.62 / 0.77 | -0.004 | same fused maps at 56% of the cost |
+| sweep offsets +-1, 4, 16 | 111 | 0.83 / 0.71 / 0.86 | 0.80 / 0.94 | 0.62 / 0.78 | -0.001 | adopted |
+| DIS fast preset | 117 | 0.81 / 0.69 / 0.84 | 0.78 / 0.93 | 0.59 / 0.74 | -0.092 | no |
+| 4 covisible keyframes instead of 6 | 135 | 0.82 / 0.71 / 0.86 | 0.81 / 0.94 | 0.62 / 0.76 | -0.002 | no gain |
+
+Is sigma informative per pixel? Weakly: the more certain half of a keyframe's estimates is more precise (0.91 vs 0.86
+overall), the rank correlation of sigma and error is 0.21 (DIS-only sigmas 0.35). Across keyframes and depths it is
+what matters (the unit-weight ablation above).
 
 What was tried on the way (`recon` branch history; offline on finished maps, household unless noted):
 
@@ -392,5 +423,6 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
   made: a candidate signal for more keyframes / more points under fast motion;
 - voxel map instead of keyframes for reprojection and loops (search by projection and the old-point search are O(map));
 - dense: untextured floors (a ground-plane prior, the planar bilateral solver with honest sigmas for filled pixels);
-  speed (0.5 s per keyframe: DIS to 6 keyframes and the sweep; the SLAM runs ~10x faster); saving and reusing maps;
+  fast motion in real time (fr1: a keyframe every 3 frames - map every n-th keyframe, or DIS only); saving and
+  reusing maps;
 - tracking through very fast motion (TartanAir).
