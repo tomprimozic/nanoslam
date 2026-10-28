@@ -15,6 +15,9 @@ live ones (as estimated at that frame), not corrected with hindsight by later lo
   drift%    drift relative to the ground truth path length
   ate       standard ATE: RMSE after aligning the whole trajectory (for reference)
   scale     scale of the final section relative to the initial section (1 = no scale drift)
+
+Dense mapping (dense()): every keyframe depth map against ground-truth depth, and the fused surface / dense points
+against the ground-truth cloud, each keyframe scaled to metres by its own sparse points (SLAM drift not counted).
 '''
 import numpy as np
 
@@ -156,3 +159,56 @@ def plot(m, gt, path, title=''):
   fig.tight_layout()
   fig.savefig(path, dpi=80)
   plt.close(fig)
+
+
+def dense(mapper, depth, step=4, thresholds=(0.02, 0.05)):
+  '''
+  dense mapping against ground-truth depth (depth: frame -> metres, 0 unknown, or None). Every keyframe map is scaled to
+  metres by its sparse points against the ground truth (so SLAM scale drift is not counted as reconstruction error).
+  Per keyframe (over the pixels with ground truth): completeness, acc10 (fraction of all within 10% in inverse depth),
+  precision (of the estimates within 10%), outliers (beyond 25%). 3D: the fused surface and the dense points against
+  the ground-truth cloud (every keyframe's ground truth placed like its map): precision (reconstruction -> ground
+  truth) and coverage (ground truth -> reconstruction) within the thresholds [m]
+  '''
+  import scipy.spatial
+  from dense import backproject
+  rows, gt_pts, mpu = [], [], []
+  for r in mapper.records.values():
+    gt = depth(r.frame)
+    if gt is None:
+      continue
+    ui, vi = np.round(r.uv).astype(int).T
+    h, w = gt.shape
+    ok = (r.z > 0) & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+    g = gt[vi[ok], ui[ok]]
+    if (g > 0).sum() < 5:
+      continue
+    sc = float(np.median(g[g > 0] / r.z[ok][g > 0]))       # metres per map unit (as computed)
+    gt = gt[::2, ::2][:r.rho.shape[0], :r.rho.shape[1]]
+    valid = gt > 0
+    est = valid & np.isfinite(r.rho) & (r.rho > 0)
+    err = np.abs(r.rho[est] / sc - 1 / gt[est]) * gt[est]
+    n = max(valid.sum(), 1)
+    rows.append([est.sum() / n, (err < 0.1).sum() / n, np.mean(err < 0.1) if est.any() else np.nan,
+                 np.mean(err > 0.25) if est.any() else np.nan])
+    X, _ = backproject(mapper.Kh, r.T, np.where(valid, sc / (np.where(valid, gt, 1) * r.scale), np.nan), step)
+    gt_pts.append(X)
+    mpu.append(sc / r.scale)
+  if not rows:
+    return {}
+  rows = np.array(rows)
+  out = {'keyframes': len(rows), 'completeness': float(np.mean(rows[:, 0])), 'acc10': float(np.mean(rows[:, 1])),
+         'precision': float(np.nanmean(rows[:, 2])), 'outliers': float(np.nanmean(rows[:, 3]))}
+  gt_pts = np.concatenate(gt_pts)
+  m = float(np.median(mpu))
+  tree = scipy.spatial.cKDTree(gt_pts)
+  for name, (P, _) in [('surface', mapper.surface()), ('points', mapper.dense_points())]:
+    if len(P) == 0:
+      continue
+    d_acc = tree.query(P)[0] * m
+    d_cov = scipy.spatial.cKDTree(P).query(gt_pts)[0] * m
+    out[f'{name}_n'] = len(P)
+    for t in thresholds:
+      out[f'{name}_precision_{int(100 * t)}cm'] = float(np.mean(d_acc < t))
+      out[f'{name}_coverage_{int(100 * t)}cm'] = float(np.mean(d_cov < t))
+  return out
