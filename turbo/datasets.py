@@ -1,6 +1,7 @@
 '''
 Dataset loaders. Every dataset yields undistorted grayscale images (so everything downstream is pinhole) and
-ground truth camera-to-world poses T_wc in the usual optical frame (x right, y down, z forward).
+ground truth camera-to-world poses T_wc in the usual optical frame (x right, y down, z forward); for the evaluation
+of dense mapping, ground-truth depth per frame (TUM: the Kinect, EuRoC: the laser scan rendered, TartanAir: rendered).
 
   TUM RGB-D       fr3/long_office_household, fr2/desk              rgbd_dataset_freiburg*/
   EuRoC MAV       MH_01..05, V1_01..03, V2_01..03                  euroc/<name>/mav0/   (cam0 only)
@@ -65,8 +66,6 @@ class Dataset:
   def depth(self, i):
     '''ground-truth depth [m] of frame i in the (undistorted) camera, 0 where unknown; None if the dataset has none'''
     return None
-
-  up = np.array([0.0, 0.0, 1.0])    # the ground truth's world up
 
   def load(self, i):
     img = cv2.imread(str(self.files[i]), cv2.IMREAD_GRAYSCALE)
@@ -205,7 +204,6 @@ class TartanAir(Dataset):
     self.gt = T @ T_ned_optical
     self.width, self.height = 640, 480
     self.setup_undistortion(make_K(320, 320, 320, 240), None)
-    self.up = np.array([0.0, 0.0, -1.0])     # (NED)
     self.depth_dir = path / 'depth_left'
 
   def depth(self, i):

@@ -1,18 +1,19 @@
 '''
 python run.py household                                   # one sequence (names: datasets.all_names())
 python run.py household --rerun                           # visualize (--rerun-save x.rrd: record to a file)
+python run.py household --dense --rerun                   # with live dense mapping (dense.py)
 python run.py all --out runs/NAME [--starts 0,7,14]        # all sequences in parallel (+ start-frame ensemble)
 python run.py summary runs/A runs/B                        # compare runs (metrics recomputed from trajectories;
                                                            # runs/A1+runs/A2 pools runs, e.g. of two seeds)
 python run.py view runs/A/household@0 ...                  # rerun view of saved runs (alignment, errors over time)
-options: --set name=value ... (override Config), --perturb SEED (scale all numeric parameters by 0.7-1.4x),
+options: --set name=value ... (override Config; dense.name=value: DenseConfig), --perturb SEED (scale all numeric
+         parameters by 0.7-1.4x), --gt (rerun: show the ground truth, aligned to the map),
          --start S (skip the first S frames), --max-frames N, --only a,b (subset of sequences for 'all')
 '''
 import os
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
-os.environ.setdefault('NUMBA_NUM_THREADS', '1')
 
 import sys
 import json
@@ -33,14 +34,18 @@ from slam import SLAM, Config
 
 
 def make_config(overrides):
-  config = Config()
+  '''Config and DenseConfig with name=value overrides (dense.name=value for DenseConfig)'''
+  from dense import DenseConfig
+  config, dense_config = Config(), DenseConfig()
   for kv in overrides:
     k, v = kv.split('=', 1)
-    if not hasattr(Config, k):
-      raise ValueError(f'unknown config {k}')
-    default = getattr(Config, k)
-    setattr(config, k, v if isinstance(default, str) else type(default)(eval(v)))
-  return config
+    target = dense_config if k.startswith('dense.') else config
+    k = k.removeprefix('dense.')
+    if not hasattr(type(target), k):
+      raise ValueError(f'unknown config {kv}')
+    default = getattr(type(target), k)
+    setattr(target, k, v if isinstance(default, str) else type(default)(eval(v)))
+  return config, dense_config
 
 
 def perturbed(seed, factor=1.4):
@@ -81,23 +86,34 @@ def lost_flags(n, frames, lost):
   return flags
 
 
-def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
+def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False, dense_config=None, show_gt=False):
   cv2.setNumThreads(1)
   data = datasets.load(name)
   stop = len(data) if max_frames is None else min(len(data), start + max_frames)
   slam = SLAM(config, data.K, data.width, data.height)
+  mapper = None
+  if dense_config is not None:
+    from dense import DenseMapper
+    mapper = DenseMapper(dense_config, slam.K, load_color=lambda f: data.load_color(f + start),
+                         load=lambda f: data.load(f + start), rr=rr, frame_offset=start)
   t0 = time.perf_counter()
   latency = []
   for i, img in data.images(start, stop):
     t = time.perf_counter()
     slam.on_frame(i - start, img)
     latency.append(time.perf_counter() - t)
+    if mapper is not None:
+      mapper.on_frame(slam, i - start, img)
     if rr is not None:
-      log_rerun(rr, slam, data, start, i, img)
+      log_rerun(rr, slam, data, start, i, img, show_gt)
     if not quiet and (i - start) % 500 == 0:
       print(f'{name} frame {i}: tracks {slam.stats.tracks[-1]} mapped {slam.stats.mapped[-1]} lost {slam.lost}', flush=True)
   slam.finish()
   elapsed = time.perf_counter() - t0
+  if mapper is not None:
+    t = time.perf_counter()
+    mapper.finish(slam)
+    dense_wait = time.perf_counter() - t
   n = stop - start
   T_final, T_online = slam.poses(n, online=False), slam.poses(n)
   gt, gt_R = data.gt[start:stop, :3, 3], data.gt[start:stop, :3, :3]
@@ -116,6 +132,9 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
     'timing': dict(slam.timing), 'counts': dict(slam.counts),
     'latency_ms': {'mean': 1e3 * np.mean(latency), 'p99': 1e3 * np.percentile(latency, 99), 'max': 1e3 * np.max(latency)},
   }
+  if mapper is not None:
+    result['dense'] = evaluate.dense(mapper, lambda f: data.depth(f + start)) | {
+      'timing': mapper.timing, 'counts': mapper.counts, 'wait_after_slam_s': dense_wait}
   if out is not None:
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / 'trajectory.npz', final=T_final[:, :3, 3], online=T_online[:, :3, 3], gt=gt, poses=T_final,
@@ -129,13 +148,24 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
 
 def format_result(r):
   o, f = r['online'], r['final']
-  return (f"{r['name']:32s} final {o['final']:6.3f} rot {o.get('rot', np.nan):5.2f} drift {o['drift']:6.3f} "
-          f"ate {o['ate']:6.3f} scale {o.get('scale', np.nan):5.2f} | hindsight: final {f['final']:6.3f} ate {f['ate']:6.3f} | "
-          f"tracked {o['tracked']:.2f} kfs {r['keyframes']:4d}/{r['keyframes_created']:4d} {r['fps']:5.1f} fps "
-          f"(max {r['latency_ms']['max']:.0f} ms) {' '.join(f'{k}={v}' for k, v in r['events'].items())}")
+  s = (f"{r['name']:32s} final {o['final']:6.3f} rot {o.get('rot', np.nan):5.2f} drift {o['drift']:6.3f} "
+       f"ate {o['ate']:6.3f} scale {o.get('scale', np.nan):5.2f} | hindsight: final {f['final']:6.3f} ate {f['ate']:6.3f} | "
+       f"tracked {o['tracked']:.2f} kfs {r['keyframes']:4d}/{r['keyframes_created']:4d} {r['fps']:5.1f} fps "
+       f"(max {r['latency_ms']['max']:.0f} ms) {' '.join(f'{k}={v}' for k, v in r['events'].items())}")
+  d = r.get('dense')
+  if d:
+    s += (f"\n{'':32s} dense: {d['counts']['maps']} maps ({d['timing']['depth'] / max(d['counts']['maps'], 1):.2f} s each), "
+          f"refused {d['counts']['refuse']}x, finished {d['wait_after_slam_s']:.0f} s after the SLAM")
+    if 'acc10' in d:
+      s += (f" | per keyframe: completeness {d['completeness']:.2f} acc10 {d['acc10']:.2f} precision {d['precision']:.2f}"
+            f" | 3D points: precision 2/5 cm {d.get('points_precision_2cm', np.nan):.2f}/{d.get('points_precision_5cm', np.nan):.2f}"
+            f" coverage {d.get('points_coverage_2cm', np.nan):.2f}/{d.get('points_coverage_5cm', np.nan):.2f}"
+            f" | surface: precision {d.get('surface_precision_2cm', np.nan):.2f}/{d.get('surface_precision_5cm', np.nan):.2f}"
+            f" coverage {d.get('surface_coverage_2cm', np.nan):.2f}/{d.get('surface_coverage_5cm', np.nan):.2f}")
+  return s
 
 
-def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None):
+def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None, dense=False):
   out.mkdir(parents=True, exist_ok=True)
   (out / 'config.json').write_text(json.dumps(overrides))
   # longest first, for better packing
@@ -146,6 +176,7 @@ def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None):
   for f in Path(__file__).parent.glob('*.py'):
     shutil.copy(f, code / f.name)
   os.environ['NANOSLAM_DATASETS'] = str(datasets.ROOT)
+  os.environ['NUMBA_NUM_THREADS'] = '1'      # (the runs are parallel already)
   # compile (numba cache) once before running in parallel
   subprocess.run([sys.executable, str(code / 'run.py'), 'household', '--max-frames', '300', '--quiet'],
                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -155,6 +186,7 @@ def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None):
     d = out / (n if len(starts) == 1 else f'{n}@{start}')
     cmd = [sys.executable, str(code / 'run.py'), n, '--out', str(d.resolve()), '--start', str(start), '--quiet']
     cmd += (['--max-frames', str(max_frames)] if max_frames else []) + (['--set', *overrides] if overrides else [])
+    cmd += ['--dense'] if dense else []
     d.mkdir(parents=True, exist_ok=True)
     with open(d / 'log.txt', 'w') as log:
       subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
@@ -271,36 +303,48 @@ def view(run_dirs, save=None):
               f"final {m['final']:.3f} drift {m['drift']:.3f} ate {m['ate']:.3f}")
 
 
-def setup_rerun(name, save=None):
+def setup_rerun(save=None):
   import rerun as rr
-  data = datasets.load(name)
   rr.init('nanoslam-turbo', spawn=save is None)
   if save is not None:
     rr.save(save)
-  rr.log('gt', rr.LineStrips3D([data.gt[:, :3, 3]], radii=0.003, colors=[128, 128, 128]), static=True)
+  rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
   return rr
 
 
-def log_rerun(rr, slam, data, start, i, img):
-  from geometry import camera_center
+def log_rerun(rr, slam, data, start, i, img, show_gt=False):
+  '''
+  the live view, in the map frame (world/map) turned so that the estimated up is +Z: image with tracks, camera, path
+  (with hindsight), keyframes, map points; show_gt: the ground truth, Sim3-aligned to the map (display only)
+  '''
+  from geometry import camera_center, inv_pose
+  from dense import estimate_up, up_rotation
   rr.set_time('frame', sequence=i)
   vis = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-  mapped = slam.mapped_tracks()
-  for (x, y), m in zip(slam.tr_uv, mapped):
+  for (x, y), m in zip(slam.tr_uv, slam.mapped_tracks()):
     cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0) if m else (255, 0, 0), -1)
   rr.log('image', rr.Image(vis).compress(80))
-  if not slam.initialized or i % 5:
+  if not slam.initialized:
     return
-  final, _ = slam.trajectory(i - start + 1)
-  gt = data.gt[start:i + 1, :3, 3]
-  valid = np.isfinite(final).all(axis=1)
-  if valid.sum() < 10:
-    return
-  to_gt, _ = evaluate.align(final[valid], gt[valid])
-  rr.log('slam/path', rr.LineStrips3D([to_gt(final[valid])], radii=0.003, colors=[0, 100, 255]))
   m = slam.map
-  rr.log('slam/keyframes', rr.Points3D(to_gt(camera_center(m.kfs.T[m.kfs.alive])), radii=0.01, colors=[255, 128, 0]))
-  rr.log('slam/points', rr.Points3D(to_gt(m.pts.X[m.pts.state == 1]), radii=0.003, colors=[200, 200, 200]))
+  T_wc = inv_pose(slam.T_cw)
+  rr.log('world/map/camera', rr.Transform3D(translation=T_wc[:3, 3], mat3x3=T_wc[:3, :3]))
+  rr.log('world/map/camera', rr.Pinhole(image_from_camera=slam.K, width=slam.width, height=slam.height,
+                                        image_plane_distance=0.1 * slam.good_depth))
+  if i % 5:
+    return
+  kfs = m.kfs.T[m.kfs.alive]
+  rr.log('world/map', rr.Transform3D(mat3x3=up_rotation(estimate_up(inv_pose(kfs)[:, :3, :3]))))
+  path = slam.poses(i - start + 1, online=False)[:, :3, 3]
+  valid = np.isfinite(path).all(axis=1)
+  rr.log('world/map/slam/path', rr.LineStrips3D([path[valid]], radii=0.003, colors=[255, 200, 0]))
+  rr.log('world/map/slam/keyframes', rr.Points3D(camera_center(kfs), radii=0.01, colors=[255, 128, 0]))
+  rr.log('world/map/slam/points', rr.Points3D(m.pts.X[m.pts.state == 1], radii=0.003, colors=[200, 200, 200]))
+  if show_gt and valid.sum() >= 10:
+    gt = data.gt[start:i + 1, :3, 3]
+    ok = valid & np.isfinite(gt).all(axis=1)
+    to_map, _ = evaluate.align(gt[ok], path[ok])
+    rr.log('world/map/gt', rr.LineStrips3D([to_map(gt[np.isfinite(gt).all(axis=1)])], radii=0.003, colors=[150, 150, 150]))
 
 
 def main():
@@ -316,6 +360,8 @@ def main():
   parser.add_argument('--only', help='comma separated subset of datasets for "all"')
   parser.add_argument('--rerun', action='store_true', help='visualize with rerun')
   parser.add_argument('--rerun-save', help='write the rerun recording to this .rrd file instead')
+  parser.add_argument('--gt', action='store_true', help='rerun: show the ground truth (aligned to the map)')
+  parser.add_argument('--dense', action='store_true', help='live dense mapping (dense.py)')
   parser.add_argument('--quiet', action='store_true')
   parser.add_argument('--trajectory', default='online', help="summary: 'online' (live poses) or 'final' (hindsight)")
   parser.add_argument('--perturb', type=int, help='perturb all numeric parameters randomly (seed)')
@@ -330,13 +376,15 @@ def main():
   if args.dataset == 'all':
     names = args.only.split(',') if args.only else datasets.all_names()
     starts = [int(x) for x in args.starts.split(',')] if args.starts else [args.start]
-    results = run_all(names, args.set, args.out, args.jobs, starts, args.max_frames)
+    results = run_all(names, args.set, args.out, args.jobs, starts, args.max_frames, args.dense)
     for r in results:
       print(format_result(r) if 'error' not in r else f"{r['name']:32s} ERROR {r['error']}")
     return summary([str(args.out)])
   faulthandler.enable()
-  rr = setup_rerun(args.dataset, args.rerun_save) if args.rerun or args.rerun_save else None
-  r = run(args.dataset, make_config(args.set), args.out, args.start, args.max_frames, rr)
+  rr = setup_rerun(args.rerun_save) if args.rerun or args.rerun_save else None
+  config, dense_config = make_config(args.set)
+  r = run(args.dataset, config, args.out, args.start, args.max_frames, rr, dense_config=dense_config if args.dense else None,
+          show_gt=args.gt)
   print(format_result(r))
   print('timing: ' + ' '.join(f'{k}={v:.1f}s' for k, v in r['timing'].items()))
 
