@@ -64,6 +64,7 @@ class DenseConfig:
   sigma_weights = True              # off: every observation weighs 1 (KinectFusion), thresholds in observations:
   min_count = (3, 2)                # ... surface, dense points
   carve = True                      # off: free space in front of a surface does not update voxels
+  max_blocks = 500_000              # TSDF memory cap (8^3 voxels, 5.6 kB each: 2.8 GB)
   threads = 0                       # worker threads for numba (0: all)
   # display
   log_every = 10                    # keyframes between rerun refreshes of the fused model
@@ -385,17 +386,19 @@ def find_block(keys, rows, x, y, z):
 
 
 @njit(cache=True, nogil=True)
-def allocate(keys, rows, coords, n, K, T_wc, rho, trunc, voxel):
+def allocate(keys, rows, coords, n, K, T_wc, rho, sig, trunc, voxel, max_blocks):
   '''
-  allocates the blocks along every pixel's ray within the truncation of its depth; returns the new block count, or -1
-  when the hash or the block arrays need to grow first (allocation is idempotent: just call again)
+  allocates the blocks along every pixel's ray within the truncation of its depth, for pixels whose depth sigma is
+  within the truncation (more uncertain ones only update blocks that exist), at most max_blocks in all; returns the
+  new block count and whether it stopped because the hash or the block arrays need to grow first (then grow and call
+  again: the blocks allocated so far are kept, allocation is idempotent)
   '''
   h, w = rho.shape
   size = B * voxel
   for v in range(h):
     for u in range(w):
       r = rho[v, u]
-      if not r > 0:
+      if not r > 0 or sig[v, u] / (r * r) > trunc:
         continue
       x = (u - K[0, 2]) / K[0, 0]
       y = (v - K[1, 2]) / K[1, 1]
@@ -412,13 +415,15 @@ def allocate(keys, rows, coords, n, K, T_wc, rho, trunc, voxel):
         key = block_key(bx, by, bz)
         i = slot_of(keys, key)
         if keys[i] == -1:
+          if n >= max_blocks:
+            continue
           if n >= len(coords) or 2 * (n + 1) > len(keys):
-            return -1
+            return n, True
           keys[i] = key
           rows[i] = n
           coords[n, 0], coords[n, 1], coords[n, 2] = bx, by, bz
           n += 1
-  return n
+  return n, False
 
 
 @njit(cache=True, parallel=True, nogil=True)
@@ -529,8 +534,9 @@ def near_surface(keys, rows, tsdf, weight, voxel, min_weight, band, points):
 
 
 class TSDF:
-  def __init__(self, voxel, truncation, sigma_weights=True, carve=True, min_count=(3, 2)):
+  def __init__(self, voxel, truncation, sigma_weights=True, carve=True, min_count=(3, 2), max_blocks=500_000):
     self.voxel, self.trunc = voxel, truncation * voxel
+    self.max_blocks = max_blocks
     self.sigma_weights, self.carve, self.min_count = sigma_weights, carve, min_count
     self.keys = np.full(1 << 16, -1, np.int64)
     self.rows = np.zeros(1 << 16, np.int64)
@@ -541,12 +547,13 @@ class TSDF:
     self.n = 0
 
   def grow(self):
-    if 4 * self.n > len(self.keys):        # rehash into twice the slots
+    '''room for at least as many blocks again (allocate stops at half the hash slots / all block rows)'''
+    while 4 * self.n >= len(self.keys):        # rehash into twice the slots
       keys, rows = np.full(2 * len(self.keys), -1, np.int64), np.zeros(2 * len(self.keys), np.int64)
       rehash(keys, rows, self.coords, self.n)
       self.keys, self.rows = keys, rows
-    if 2 * self.n > len(self.coords):
-      cap = 2 * len(self.coords)
+    if 2 * self.n >= len(self.coords) and len(self.coords) < self.max_blocks:
+      cap = min(max(2 * len(self.coords), 2 * self.n), self.max_blocks)
       for name, fill in [('coords', 0), ('tsdf', 1), ('weight', 0), ('color', 0)]:
         a = getattr(self, name)
         new = np.full((cap,) + a.shape[1:], fill, a.dtype)
@@ -557,13 +564,11 @@ class TSDF:
     '''an inverse-depth map (NaN: none) with its sigma and RGB image (same size; K of that size)'''
     rho = np.nan_to_num(rho, nan=-1.0)
     T_wc = inv_pose(T_cw)
-    while True:
-      n = allocate(self.keys, self.rows, self.coords, self.n, K, T_wc, rho, self.trunc, self.voxel)
-      if n >= 0:
-        self.n = n
-        break
+    full = True
+    while full:
+      self.n, full = allocate(self.keys, self.rows, self.coords, self.n, K, T_wc, rho, np.nan_to_num(sig, nan=np.inf),
+                              self.trunc, self.voxel, self.max_blocks)
       self.grow()
-    self.grow()
     integrate(self.coords, self.n, self.tsdf, self.weight, self.color, self.voxel, K, T_cw, rho,
               np.nan_to_num(sig, nan=1.0), img, self.trunc, self.sigma_weights, self.carve)
 
@@ -732,7 +737,7 @@ class DenseMapper:
     self.records = {}             # keyframe -> Record (worker thread)
     self.tsdf = None
     self.timing = {'depth': 0.0, 'fuse': 0.0, 'refuse': 0.0, 'log': 0.0}
-    self.counts = {'maps': 0, 'refuse': 0, 'skipped': 0}
+    self.counts = {'maps': 0, 'refuse': 0, 'skipped': 0, 'revoxel': 0}
     self.flows = Flows(config.dis_preset, config.keyframes)
     self.queue = queue.Queue()
     self.pending_lock = threading.Lock()
@@ -922,6 +927,17 @@ class DenseMapper:
     r.T, r.scale = job.T, 1.0
     self.tsdf.integrate(self.Kh, r.T, r.rho, r.sig, r.color)
     self.timing['fuse'] += time.perf_counter() - t
+    # the voxel follows the scene: if the recent keyframes' depth (map units; the monocular scale drifts) is off by more
+    # than 2x from the one the voxel was made for, the TSDF is rebuilt at the new size from the stored maps
+    recent = list(self.records.values())[-10:]
+    depth = float(np.median([np.median(q.z[q.z > 0]) * q.scale for q in recent]))
+    if len(recent) == 10 and not 0.5 < self.c.voxel * depth / self.tsdf.voxel < 2:
+      t = time.perf_counter()
+      self.tsdf = self.new_tsdf(self.c.voxel * depth)
+      for q in self.records.values():
+        self.tsdf.integrate(self.Kh, q.T, q.rho / q.scale, q.sig / q.scale, q.color)
+      self.counts['revoxel'] += 1
+      self.timing['refuse'] += time.perf_counter() - t
     if self.rr is not None:
       self.rr.set_time('frame', sequence=job.now + self.frame_offset)
       if self.c.log_depth:      # (in the camera frame, under the keyframe's transform: re-fusing moves only that)
@@ -955,7 +971,7 @@ class DenseMapper:
       self.log(now)
 
   def new_tsdf(self, voxel):
-    return TSDF(voxel, self.c.truncation, self.c.sigma_weights, self.c.carve, self.c.min_count)
+    return TSDF(voxel, self.c.truncation, self.c.sigma_weights, self.c.carve, self.c.min_count, self.c.max_blocks)
 
   def log_placement(self, k, r):
     T_wc = inv_pose(r.T)
