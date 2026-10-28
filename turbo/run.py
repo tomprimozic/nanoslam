@@ -86,7 +86,8 @@ def lost_flags(n, frames, lost):
   return flags
 
 
-def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False, dense_config=None, show_gt=False):
+def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False, dense_config=None, show_gt=False,
+        realtime=False):
   cv2.setNumThreads(1)
   data = datasets.load(name)
   stop = len(data) if max_frames is None else min(len(data), start + max_frames)
@@ -99,6 +100,8 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False, 
   t0 = time.perf_counter()
   latency = []
   for i, img in data.images(start, stop):
+    if realtime:      # (frames arrive at the camera's rate: wait for this one's time)
+      time.sleep(max(0.0, data.timestamps[i] - data.timestamps[start] - (time.perf_counter() - t0)))
     t = time.perf_counter()
     slam.on_frame(i - start, img)
     latency.append(time.perf_counter() - t)
@@ -154,8 +157,9 @@ def format_result(r):
        f"(max {r['latency_ms']['max']:.0f} ms) {' '.join(f'{k}={v}' for k, v in r['events'].items())}")
   d = r.get('dense')
   if d:
-    s += (f"\n{'':32s} dense: {d['counts']['maps']} maps ({d['timing']['depth'] / max(d['counts']['maps'], 1):.2f} s each), "
-          f"refused {d['counts']['refuse']}x, finished {d['wait_after_slam_s']:.0f} s after the SLAM")
+    s += (f"\n{'':32s} dense: {d['counts']['maps']} maps ({d['timing']['depth'] / max(d['counts']['maps'], 1):.2f} s each, "
+          f"{d['counts'].get('skipped', 0)} keyframes skipped), "
+          f"re-fused {d['counts']['refuse']}x, finished {d['wait_after_slam_s']:.1f} s after the SLAM")
     if 'acc10' in d:
       s += (f" | per keyframe: completeness {d['completeness']:.2f} acc10 {d['acc10']:.2f} precision {d['precision']:.2f}"
             f" | 3D points: precision 2/5 cm {d.get('points_precision_2cm', np.nan):.2f}/{d.get('points_precision_5cm', np.nan):.2f}"
@@ -362,6 +366,8 @@ def main():
   parser.add_argument('--rerun-save', help='write the rerun recording to this .rrd file instead')
   parser.add_argument('--gt', action='store_true', help='rerun: show the ground truth (aligned to the map)')
   parser.add_argument('--dense', action='store_true', help='live dense mapping (dense.py)')
+  parser.add_argument('--realtime', action='store_true',
+                      help="frames at the camera's rate; dense mapping skips keyframes when behind (dense.max_queue=2)")
   parser.add_argument('--quiet', action='store_true')
   parser.add_argument('--trajectory', default='online', help="summary: 'online' (live poses) or 'final' (hindsight)")
   parser.add_argument('--perturb', type=int, help='perturb all numeric parameters randomly (seed)')
@@ -382,9 +388,9 @@ def main():
     return summary([str(args.out)])
   faulthandler.enable()
   rr = setup_rerun(args.rerun_save) if args.rerun or args.rerun_save else None
-  config, dense_config = make_config(args.set)
+  config, dense_config = make_config((['dense.max_queue=2'] if args.realtime else []) + args.set)
   r = run(args.dataset, config, args.out, args.start, args.max_frames, rr, dense_config=dense_config if args.dense else None,
-          show_gt=args.gt)
+          show_gt=args.gt, realtime=args.realtime)
   print(format_result(r))
   print('timing: ' + ' '.join(f'{k}={v:.1f}s' for k, v in r['timing'].items()))
 
