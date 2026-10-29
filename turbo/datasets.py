@@ -50,6 +50,7 @@ class Dataset:
   files: list           # image paths
   timestamps: np.ndarray
   gt: np.ndarray        # (N, 4, 4) T_wc
+  up = np.array([0.0, 0.0, 1.0])    # the ground truth's world up (display only)
 
   def setup_undistortion(self, K, dist):
     self.maps = None
@@ -67,6 +68,13 @@ class Dataset:
     if self.maps is not None:
       img = cv2.remap(img, *self.maps, cv2.INTER_LINEAR)
     return img
+
+  def load_color(self, i):
+    '''RGB, undistorted like load() (grey images: repeated)'''
+    img = cv2.imread(str(self.files[i]), cv2.IMREAD_COLOR)
+    if self.maps is not None:
+      img = cv2.remap(img, *self.maps, cv2.INTER_LINEAR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
   def images(self, start=0, stop=None, prefetch=8):
     '''yields (index, image), loading ahead in background threads (cv2 releases the GIL)'''
@@ -132,6 +140,7 @@ class TartanAir(Dataset):
     T_ned_optical = np.eye(4)
     T_ned_optical[:3, :3] = [[0, 0, 1], [1, 0, 0], [0, 1, 0]]
     self.gt = T @ T_ned_optical
+    self.up = np.array([0.0, 0.0, -1.0])     # (NED)
     self.width, self.height = 640, 480
     self.setup_undistortion(make_K(320, 320, 320, 240), None)
 

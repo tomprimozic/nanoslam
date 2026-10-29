@@ -29,6 +29,7 @@ import numpy as np
 
 import datasets
 import evaluate
+import geometry
 from slam import SLAM, Config
 
 
@@ -70,19 +71,21 @@ def lost_flags(n, frames, lost):
   return flags
 
 
-def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
+def run(name, config, out=None, start=0, max_frames=None, rerun=None, quiet=False):
+  '''rerun: None, 'spawn' (a viewer) or the path of a recording'''
   cv2.setNumThreads(1)
   data = datasets.load(name)
   stop = len(data) if max_frames is None else min(len(data), start + max_frames)
   slam = SLAM(config, data.K, data.width, data.height)
+  view = View(data, start, stop, slam.K, None if rerun == 'spawn' else rerun) if rerun else None
   t0 = time.perf_counter()
   latency = []
   for i, img in data.images(start, stop):
     t = time.perf_counter()
     slam.on_frame(i - start, img)
     latency.append(time.perf_counter() - t)
-    if rr is not None:
-      log_rerun(rr, slam, data, start, i, img)
+    if view is not None:
+      view.frame(slam, i, img)
     if not quiet and (i - start) % 500 == 0:
       print(f'{name} frame {i}: tracks {slam.stats.tracks[-1]} mapped {slam.stats.mapped[-1]} lost {slam.lost}', flush=True)
   slam.finish()
@@ -116,11 +119,17 @@ def run(name, config, out=None, start=0, max_frames=None, rr=None, quiet=False):
 
 
 def format_result(r):
+  '''
+  live: the poses as estimated at each frame (final = last 10% RMSE [m], rot [deg], drift, ate [m], scale); hindsight:
+  the keyframe-relative poses at the end; keyframes alive / created; events: pre_keyframe (made before translation
+  was established, rotation-only pose), init, resume (map continued after being lost), mapless (lost), reloc
+  (relocalized), cull_kf, loop, merge
+  '''
   o, f = r['online'], r['final']
-  return (f"{r['name']:32s} final {o['final']:6.3f} rot {o.get('rot', np.nan):5.2f} drift {o['drift']:6.3f} "
-          f"ate {o['ate']:6.3f} scale {o.get('scale', np.nan):5.2f} | hindsight: final {f['final']:6.3f} ate {f['ate']:6.3f} | "
-          f"tracked {o['tracked']:.2f} kfs {r['keyframes']:4d}/{r['keyframes_created']:4d} {r['fps']:5.1f} fps "
-          f"(max {r['latency_ms']['max']:.0f} ms) {' '.join(f'{k}={v}' for k, v in r['events'].items())}")
+  return (f"{r['name']:32s} live: final={o['final']:.3f} rot={o.get('rot', np.nan):.2f} drift={o['drift']:.3f} "
+          f"ate={o['ate']:.3f} scale={o.get('scale', np.nan):.2f} | hindsight: final={f['final']:.3f} ate={f['ate']:.3f} | "
+          f"tracked={o['tracked']:.2f} keyframes={r['keyframes']}/{r['keyframes_created']} fps={r['fps']:.1f} "
+          f"max_latency={r['latency_ms']['max']:.0f}ms | {' '.join(f'{k}={v}' for k, v in r['events'].items())}")
 
 
 def run_all(names, overrides, out, jobs, starts=(0,), max_frames=None):
@@ -259,36 +268,100 @@ def view(run_dirs, save=None):
               f"final {m['final']:.3f} drift {m['drift']:.3f} ate {m['ate']:.3f}")
 
 
-def setup_rerun(name, save=None):
-  import rerun as rr
-  data = datasets.load(name)
-  rr.init('nanoslam-turbo', spawn=save is None)
-  if save is not None:
-    rr.save(save)
-  rr.log('gt', rr.LineStrips3D([data.gt[:, :3, 3]], radii=0.003, colors=[128, 128, 128]), static=True)
-  return rr
+class View:
+  '''
+  live rerun view, in metres with the ground truth's up as +Z: the SLAM (camera with its image, path with hindsight,
+  keyframes, map points coloured from their keyframe's image) Sim3-aligned into the ground truth on the initial section
+  (as in the evaluation) and then frozen, so what follows is the drift. Sizes are fractions of the ground truth's
+  horizontal span; the 3D view starts behind the first camera, looking where it looks (level)
+  '''
+  SIZES = {'gt': 0.001, 'path': 0.001, 'keyframes': 0.002, 'points': 0.0006, 'image': 0.04}
 
+  def __init__(self, data, start, stop, K, save=None):
+    import rerun as rr
+    import rerun.blueprint as rrb
+    self.rr, self.data, self.start, self.K = rr, data, start, K
+    gt = data.gt[start:stop]
+    up = data.up / np.linalg.norm(data.up)
+    v, c = np.cross(up, [0, 0, 1]), float(up[2])        # the rotation taking up to +Z
+    V = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    self.R_up = np.eye(3) + V + V @ V / (1 + c) if c > -1 + 1e-9 else np.diag([1.0, -1.0, -1.0])
+    ok = np.isfinite(gt[:, 0, 3])
+    self.gt = np.where(ok[:, None], gt[:, :3, 3] @ self.R_up.T, np.nan)
+    span = float(np.max(np.ptp(self.gt[ok, :2], axis=0)))
+    self.size = {k: f * span for k, f in self.SIZES.items()}
+    self.align_until = evaluate.initial_section(self.gt) - 1      # (frames since start)
+    self.sim = None                    # SLAM -> display: (s, R, t)
+    self.n_kfs = 0
+    self.kf_rgb = {}                   # keyframe -> RGB image (half resolution), to colour its points
+    self.colors = np.zeros((0, 3), np.uint8)
+    self.colored = np.zeros(0, bool)
+    rr.init('nanoslam-turbo', spawn=save is None)
+    if save is not None:
+      rr.save(save)
+    i0 = int(np.argmax(ok))
+    C0, f = self.gt[i0], self.R_up @ gt[i0, :3, 2]
+    f = np.array([f[0], f[1], 0.0]) / max(np.linalg.norm(f[:2]), 1e-9)      # (looking direction, level)
+    rr.send_blueprint(rrb.Blueprint(rrb.Horizontal(
+      rrb.Spatial3DView(origin='world', eye_controls=rrb.EyeControls3D(
+        position=C0 - 0.3 * span * f + [0, 0, 0.15 * span], look_target=C0 + 0.5 * span * f, eye_up=[0, 0, 1])),
+      rrb.Spatial2DView(origin='world/camera/image'), column_shares=[3, 1]), collapse_panels=True))
+    rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    rr.log('world/gt', rr.LineStrips3D([self.gt[ok]], radii=self.size['gt'], colors=[150, 150, 150]), static=True)
+    rr.log('world/camera/image', rr.Pinhole(image_from_camera=K, width=data.width, height=data.height,
+                                            image_plane_distance=self.size['image']), static=True)
 
-def log_rerun(rr, slam, data, start, i, img):
-  from geometry import camera_center
-  rr.set_time('frame', sequence=i)
-  vis = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-  mapped = slam.mapped_tracks()
-  for (x, y), m in zip(slam.tr_uv, mapped):
-    cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0) if m else (255, 0, 0), -1)
-  rr.log('image', rr.Image(vis).compress(80))
-  if not slam.initialized or i % 5:
-    return
-  final, _ = slam.trajectory(i - start + 1)
-  gt = data.gt[start:i + 1, :3, 3]
-  valid = np.isfinite(final).all(axis=1)
-  if valid.sum() < 10:
-    return
-  to_gt, _ = evaluate.align(final[valid], gt[valid])
-  rr.log('slam/path', rr.LineStrips3D([to_gt(final[valid])], radii=0.003, colors=[0, 100, 255]))
-  m = slam.map
-  rr.log('slam/keyframes', rr.Points3D(to_gt(camera_center(m.kfs.T[m.kfs.alive])), radii=0.01, colors=[255, 128, 0]))
-  rr.log('slam/points', rr.Points3D(to_gt(m.pts.X[m.pts.state == 1]), radii=0.003, colors=[200, 200, 200]))
+  def to_display(self, X):
+    s, R, t = self.sim
+    return s * X @ R.T + t
+
+  def frame(self, slam, i, img):
+    from geometry import camera_center, inv_pose
+    from map import MAPPED
+    rr, m, f = self.rr, slam.map, i - self.start
+    rr.set_time('frame', sequence=i)
+    vis = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    for (x, y), mapped in zip(slam.tr_uv, slam.mapped_tracks()):      # green: tracked map points, red: candidates
+      cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0) if mapped else (255, 0, 0), -1)
+    rr.log('world/camera/image', rr.Image(vis).compress(80))
+    for k in range(self.n_kfs, len(m.kfs)):           # new keyframes: keep their colours
+      if m.kfs.frame[k] == f:
+        rgb = self.data.load_color(i)
+        self.kf_rgb[k] = cv2.resize(rgb, (rgb.shape[1] // 2, rgb.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    self.n_kfs = len(m.kfs)
+    if not slam.initialized:
+      return
+    path = slam.poses(f + 1, online=False)[:, :3, 3]
+    valid = np.isfinite(path).all(axis=1) & np.isfinite(self.gt[:f + 1]).all(axis=1)
+    if valid.sum() < 10:
+      return
+    if self.sim is None or f <= self.align_until or valid.sum() < 30:     # (then frozen: what follows is the drift)
+      s, R, t = geometry.umeyama(self.gt[:f + 1][valid], path[valid])
+      self.sim = (s, R, t)
+    T_wc = inv_pose(slam.T_cw)
+    rr.log('world/camera', rr.Transform3D(translation=self.to_display(T_wc[:3, 3]), mat3x3=self.sim[1] @ T_wc[:3, :3]))
+    if f % 5:
+      return
+    ok = np.isfinite(path).all(axis=1)
+    rr.log('world/slam/path', rr.LineStrips3D([self.to_display(path[ok])], radii=self.size['path'], colors=[0, 120, 255]))
+    alive = np.flatnonzero(m.kfs.alive)
+    rr.log('world/slam/keyframes', rr.Points3D(self.to_display(camera_center(m.kfs.T[alive])),
+                                               radii=self.size['keyframes'], colors=[255, 140, 0]))
+    pts = np.flatnonzero(m.pts.state == MAPPED)
+    if len(self.colors) < len(m.pts):
+      self.colors = np.r_[self.colors, np.full((len(m.pts) - len(self.colors), 3), 160, np.uint8)]
+      self.colored = np.r_[self.colored, np.zeros(len(m.pts) - len(self.colored), bool)]
+    new = pts[~self.colored[pts]]
+    for k in np.unique(m.pts.ref[new]):                # colour from the reference keyframe's image
+      if k in self.kf_rgb:
+        sel = new[m.pts.ref[new] == k]
+        uv = np.clip(np.round(m.pts.ref_uv[sel] / 2).astype(int), 0, np.array(self.kf_rgb[k].shape[1::-1]) - 1)
+        self.colors[sel] = self.kf_rgb[k][uv[:, 1], uv[:, 0]]
+        self.colored[sel] = True
+    for k in [k for k in self.kf_rgb if not m.kfs.alive[k]]:
+      del self.kf_rgb[k]
+    rr.log('world/slam/points', rr.Points3D(self.to_display(m.pts.X[pts]), radii=self.size['points'],
+                                            colors=self.colors[pts]))
 
 
 def main():
@@ -323,8 +396,8 @@ def main():
       print(format_result(r) if 'error' not in r else f"{r['name']:32s} ERROR {r['error']}")
     return summary([str(args.out)])
   faulthandler.enable()
-  rr = setup_rerun(args.dataset, args.rerun_save) if args.rerun or args.rerun_save else None
-  r = run(args.dataset, make_config(args.set), args.out, args.start, args.max_frames, rr)
+  rerun = args.rerun_save or ('spawn' if args.rerun else None)
+  r = run(args.dataset, make_config(args.set), args.out, args.start, args.max_frames, rerun)
   print(format_result(r))
   print('timing: ' + ' '.join(f'{k}={v:.1f}s' for k, v in r['timing'].items()))
 
