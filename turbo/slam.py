@@ -1041,7 +1041,8 @@ class SLAM:
     the keyframe parallax threshold at the scene depth), orientation and points
     '''
     c, m = self.c, self.map
-    candidates = [k for k in candidates if 1 < k < kf - 2 and m.kfs.alive[k]]
+    keep = self.provisional[:2] if self.provisional is not None else ()     # (merge_provisional relies on them)
+    candidates = [k for k in candidates if 1 < k < kf - 2 and m.kfs.alive[k] and k not in keep]
     if not candidates:
       return
     C = m.covisibility_matrix()
@@ -1222,11 +1223,16 @@ class SLAM:
         pairs[(int(k), int(j[sel][i]))] = n[sel][i]
       if m.kfs.parent[k] >= 0:
         pairs.setdefault((int(k), int(m.kfs.parent[k])), c.ba_min_covisible)
-    edges = [(row[k], row[j], S[row[k]] @ sim3_inv(S[row[j]]), max(n, c.ba_min_covisible) / 100)
-             for (k, j), n in pairs.items() if m.kfs.alive[k] and m.kfs.alive[j]]
     src = collections.Counter(m.pts.ref[pts].tolist()).most_common(1)[0][0]
     if not m.kfs.alive[src]:
       return
+    if self.provisional is not None and src < self.provisional[1] <= kf:
+      # the provisional part found the old map: its links to the old map (the junction edge, covisibility through the
+      # junction's points) hold the guessed scale - drop them, the loop edge alone places the part (as a whole)
+      first = self.provisional[1]
+      pairs = {(k, j): n for (k, j), n in pairs.items() if (k >= first) == (j >= first)}
+    edges = [(row[k], row[j], S[row[k]] @ sim3_inv(S[row[j]]), max(n, c.ba_min_covisible) / 100)
+             for (k, j), n in pairs.items() if m.kfs.alive[k] and m.kfs.alive[j]]
     # all other edges hold the current relative poses: only the new loop edge has an error
     S_kf = sim3(1 / s, T_loop[:3, :3], T_loop[:3, 3] / s)
     edges.append((row[kf], row[src], S_kf @ sim3_inv(S[row[src]]), 10 * max(len(pts), 15) / 100))
@@ -1327,7 +1333,8 @@ class SLAM:
             self.velocity = np.eye(4)
           if c.mapless:
             self.start_mapless()
-        self.epipolar_filter()
+        if ok:      # (not with a predicted / rotation-only pose: it would drop good candidates)
+          self.epipolar_filter()
         if not self.initializing and self.need_keyframe():
           with self.timed('keyframe'):
             self.create_keyframe()
