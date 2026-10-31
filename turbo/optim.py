@@ -516,6 +516,8 @@ def so3_log(R):
     i = np.argmax(a)
     axis = R[:, i] + np.eye(3)[i]
     axis /= np.sqrt(np.sum(axis * axis))
+    if axis[0] * w[0] + axis[1] * w[1] + axis[2] * w[2] < 0:     # (the diagonal gives the axis up to its sign)
+      axis = -axis
     return th * axis
   return th / (2 * np.sin(th)) * w
 
