@@ -21,10 +21,10 @@ def inv_pose(T):
 
 
 def orthonormalize(T):
-  '''project the rotation block back onto SO(3) (poses updated by repeated multiplication drift off it)'''
-  U, _, VT = np.linalg.svd(T[:3, :3])
+  '''project the rotation block(s) back onto SO(3) (poses updated by repeated multiplication drift off it)'''
+  U, _, VT = np.linalg.svd(T[..., :3, :3])
   T = T.copy()
-  T[:3, :3] = U @ VT
+  T[..., :3, :3] = U @ VT
   return T
 
 

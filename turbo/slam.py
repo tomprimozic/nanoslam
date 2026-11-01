@@ -966,7 +966,7 @@ class SLAM:
       if parent >= 0:
         D[k] = D[parent]
     alive = m.kfs.alive.copy()
-    m.kfs.T[alive] = T_now[alive] @ D[alive]
+    m.kfs.T[alive] = orthonormalize(T_now[alive] @ D[alive])
     # points: optimized ones get their new position, the others move with their reference keyframe
     mapped = m.pts.state == MAPPED
     moved = np.flatnonzero(mapped)
@@ -1017,7 +1017,7 @@ class SLAM:
       return
     with self.timed('ba'):
       T, X, e2 = optim.bundle_adjust(*args[0], **args[1])
-    m.kfs.T[kfs] = T
+    m.kfs.T[kfs] = orthonormalize(T)
     m.pts.X[pts] = X
     m.remove_obs(o[~(e2 <= optim.CHI2_2D)])
     if m.kfs.frame[self.last_kf] == self.frame:     # (the current frame is that keyframe: its pose is the live one)
@@ -1185,7 +1185,7 @@ class SLAM:
       return T
     part = np.flatnonzero(m.kfs.alive)
     part = part[part >= first]
-    m.kfs.T[part] = move(m.kfs.T[part])
+    m.kfs.T[part] = orthonormalize(move(m.kfs.T[part]))
     p = np.setdiff1d(np.flatnonzero(m.pts.state == MAPPED), old_pts)
     m.pts.X[p] = s * m.pts.X[p] @ R_S.T + t_S
     i = np.flatnonzero(self.traj.ref >= first)
@@ -1247,7 +1247,7 @@ class SLAM:
     M = np.einsum('nij,njk->nik', np.array([sim3_inv(Sn) for Sn in S_new]), S)[ref]
     m.pts.X[p] = np.einsum('nij,nj->ni', M[:, :3, :3], m.pts.X[p]) + M[:, :3, 3]
     moved = np.linalg.norm(camera_center(sim3_to_se3(S_new[row[kf]])) - camera_center(m.kfs.T[kf]))
-    m.kfs.T[alive] = np.array([sim3_to_se3(Sn) for Sn in S_new])
+    m.kfs.T[alive] = orthonormalize(np.array([sim3_to_se3(Sn) for Sn in S_new]))
     self.T_good = m.kfs.T[kf].copy()
     i = np.flatnonzero(row[self.traj.ref] >= 0)
     self.traj.T[i, :3, 3] /= np.array([sim3_scale(Sn) for Sn in S_new])[row[self.traj.ref[i]], None]
