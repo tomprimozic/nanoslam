@@ -47,7 +47,7 @@ class Config:
   # (batch BA over the frames since the anchor keyframe, see try_initialize)
   init_window = 20                  # frames in the window BA (subsampled)
   init_check_parallax = 0.0         # deg, median parallax before a window test is attempted (0: every frame)
-  init_test = 'marginal'            # translation test: 'marginal' (slamfold: depths integrated out, the null is
+  init_test = 'marginal'            # translation test: 'marginal' (depths integrated out, the null is
                                     # 1.5 x 3(W-1)/2 nats) or 'map' (MAP depths, null = the extra parameters)
   init_ratio = 2.0                  # translation established: likelihood ratio full vs rotation-only > this x the null
   init_seed = 'angle'               # map seeding: 'angle' (>= tri_min_angle of parallax, init_min_points and
@@ -335,7 +335,7 @@ class SLAM:
 
   def translation_test(self, T, R_rot, X, cam, pt, uv, host_uv, res_rot):
     '''
-    slamfold's test: likelihood ratio of the full model (window BA rotations and translation directions, every
+    the translation test: likelihood ratio of the full model (window BA rotations and translation directions, every
     landmark's inverse depth integrated out under a flat prior, its host bearing integrated by Laplace; the
     translation magnitude - the prior's support in the BA's gauge - at its optimum) vs the nested rotation-only model,
     in units of the noise level (from the rotation-only residuals); the null is 1.5 x half a nat per extra
@@ -389,7 +389,8 @@ class SLAM:
     batch BA over the frames since the anchor keyframe (subsampled), started from the rotation-only rotations and the
     two-view translation direction; initialized once the rotation-only model clearly explains the tracks worse than the
     full one (residual scale ratio, a likelihood ratio without the noise level) and enough points have parallax.
-    (An approximation of slamfold's test: the full model's depths are MAP estimates in a robust cost, not integrated out)
+    (An approximation of the 'marginal' test: the full model's depths are MAP estimates in a robust cost, not integrated
+    out)
     '''
     c, m = self.c, self.map
     kf0, sub, ref = self.init_anchor()
