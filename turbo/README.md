@@ -64,7 +64,7 @@ and when found the part gets the old map's scale and pose (the loop closure's po
 Sim3 of the whole part). Regimes are decided intrinsically: PnP failure, the likelihood ratio, the number of scale
 points.
 
-**Initialization** (`try_initialize`; the design follows `../../slamfold/DESIGN.md`). Until translation is
+**Initialization** (`try_initialize`). Until translation is
 established the system tracks like a rotation-only one: every frame gets the *rotation-only* pose (robust Wahba on
 the bearings of the tracks w.r.t. the last keyframe, position held), and when fewer than 70% of the tracks survive a
 keyframe is made at that pose with new corners (`pre_keyframe`), so orientation carries through e.g. turning 90 deg
@@ -72,15 +72,15 @@ and then moving. The translation test is relative to an *anchor* keyframe - the 
 points are tracked, then the newest one: every frame a batch BA runs over the frames since the anchor, up to 20 of them chosen evenly in parallax (a long still start collapses to a few): rotations
 start from the rotation-only solution of each frame, translations from the 5-point direction scaled by the frame's
 parallax, points from two-view triangulation; gauge = anchor fixed + scale along the baseline. Translation is
-established by slamfold's test (`translation_test`): the likelihood ratio of the full model against the nested
+established by a likelihood-ratio test (`translation_test`): the full model against the nested
 rotation-only one, with every landmark's inverse depth integrated out (quadrature on a per-landmark grid, flat prior)
 and its host bearing integrated (Laplace), Huber per observation, above 2x the null of 1.5 x half a nat per extra pose
-parameter. Two changes for real data: the translation magnitude, which the BA's gauge fixes, is set to the optimum of
-the integrated likelihood (a 1-D search over the prior's support; slamfold optimizes t), and the noise level comes from
-the rotation-only residuals (unbiased without translation; slamfold assumes it known). The map is made once >= 50
-points (and >= half of the inliers) have >= 1 deg of parallax - slamfold's "resolved depth" rule (posterior std < 20%
-of the mean) seeded maps from 1-5 mm baselines whose depths were overconfident (correlated KLT errors), doubling the
-early error. The window's points seed the map,
+parameter. Two details matter on real data: the translation magnitude, which the BA's gauge fixes, is set to the optimum of
+the integrated likelihood (a 1-D search over the prior's support), and the noise level comes from
+the rotation-only residuals (unbiased without translation) instead of being assumed known. The map is made once >= 50
+points (and >= half of the inliers) have >= 1 deg of parallax - seeding it with the depths the integrated posterior
+calls resolved (posterior std < 20% of the mean) started maps from 1-5 mm baselines whose depths were overconfident
+(correlated KLT errors), doubling the early error. The window's points seed the map,
 the last frame becomes the second keyframe, the other pre-translation keyframes leave the map (their positions were
 only assumed) and the window's frames get their poses with hindsight. Compared with the two-view initialization
 (5-point + 2.5 deg median parallax) it initializes earlier where the start is slow (household frame 14 vs 61, MH_05
@@ -88,6 +88,19 @@ only assumed) and the window's frames get their poses with hindsight. Compared w
 (final 0.98 [0.88, 1.07]). Between the translation test passing and the map conditions (the window BA's points do
 not have enough parallax yet; typically the last ~10 frames) the live pose is the window BA's current pose
 (`window_poses`): the rotation-only model would absorb the translation into the rotation (~1 deg off at the switch).
+
+*Why this design* (measured on synthetic sequences with ground-truth tracks while it was developed: 0.3 px noise, 150
+tracks, 30-frame windows). A likelihood ratio against the nested rotation-only model detects translation at ~0.6 px of
+parallax, where a parallax-angle threshold needs ~9 px, and depths triangulated before such a threshold fires carry the
+wrong rotation. The depths are integrated out rather than estimated: with MAP depths the null level of the ratio grows
+with the number of landmarks (each depth exists only under the alternative), integrated it stays at ~1.5 x half a nat
+per extra pose parameter, independent of the track count. The inverse-depth prior is flat and the scale is fixed by the
+gauge, never by a prior: N weak depth priors add up to a prior on the mean inverse depth, which is the weakly
+observable bas-relief direction (all inverse depths offset together, compensated by a rotation), and biased the
+rotation by ~0.1 deg. The full solve starts from the rotation-only solution (from zero motion a pan gets stuck), and
+each landmark's host bearing is a parameter too (taking the first pixel as exact gave 3-5 sigma depth errors). A
+relief-free scene (a plane) at a tiny baseline is the hard case: translation is detected only weakly and its direction
+stays undetermined until there is more parallax.
 
 **Patch alignment** (`lk.py`). The template comes from a keyframe that observed the point: sampled around that
 observation, warped with the local affine approximation of the homography of the plane through the point
@@ -279,7 +292,7 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | when lost: a new map part from the rotation-only pose with the tracks continued (instead of waiting to relocalize) | 360 tracked 5 -> 95%, but the new part's scale is off (median-depth guess, 0.3-0.6x) and it stops relocalizing against the old map: room 0.09 -> 1.1 m, V2_03 0.18 -> 1.35 m | not kept (see Next) |
 | when lost: rotation-only poses from tracks of their own (map untouched; validity: half the tracks within 3 px), also the first relocalization hypothesis, 22 sequences, 2 seeds | rotation 0.92 [0.79, 1.01] (360 72 -> 24 deg, rpy 6.0 -> 2.3, desk2 25 -> 29), final 0.98 [0.96, 1.00]; sequences that never lose track unchanged; without the validity check abandonedfactory's dark last frames give 10.8 deg instead of 2.6 | adopted |
 | review fixes: background BA corrections propagated in the world frame (were camera-frame), loop pose re-estimated after merging a pending BA, frames between keyframes rescaled with loop corrections, frames of dropped pre-init keyframes re-expressed; summaries use the saved frame range, full, 2 seeds | live: final 1.01 [0.95, 1.08], ATE 0.99; hindsight: ATE 0.95 [0.90, 0.99], final 0.93 [0.79, 1.05]; VO unchanged | fixed |
-| translation test: depths integrated out (slamfold) instead of MAP depths, map seeded with slamfold's resolved depths, no parallax gate, 22 sequences, 2 seeds | inits at 1-5 mm of baseline (mean frame 10 vs 26), early error 0.40 -> 0.87% of the path; full final 1.46 [1.15, 1.99], VO 1.26 [1.02, 1.72] | no (seeding) |
+| translation test: depths integrated out instead of MAP depths, map seeded with the resolved depths (posterior std < 20% of the mean), no parallax gate, 22 sequences, 2 seeds | inits at 1-5 mm of baseline (mean frame 10 vs 26), early error 0.40 -> 0.87% of the path; full final 1.46 [1.15, 1.99], VO 1.26 [1.02, 1.72] | no (seeding) |
 | ... with the map seeded by the parallax rule as before | full final 0.92 [0.83, 1.00], ATE 0.96; VO final 0.97 [0.86, 1.06], ATE 0.95 [0.84, 1.02]; pre-init rotation error 0.42 -> 0.27 deg; same init frames; ~22 ms per pre-init frame (the test: 6 ms) | adopted |
 | pose graph: allocation-free numerical Jacobians, normal equations in a fixed pattern (numba), SuperLU in symmetric mode | same solutions (1e-10), V1_02 309 -> 51 ms, household 92 -> 25 ms; benchmark neutral (full final 0.99 [0.97, 1.00]) | adopted |
 | relocalization: round-robin keyframes nearest first, cursor by the number tried; `reloc_max_hypotheses` cap per frame | cap 4 vs none: final 0.99 [0.98, 1.00], ATE 1.00 (2 sequences change); mapless frames 129 -> 18 ms on desk2 | option (no cap by default) |
@@ -309,8 +322,8 @@ made losing track look *better* than tracking badly; fr2/desk ground truth inter
   forward-backward check (0.5 px) drops ~60% of the new corners per frame under blur (desk2), but a threshold relative
   to the frame breaks texture-poor scenes; dark scenes (abandonedfactory's end) need their own mode;
 - initialization: the window BA's poses from the integrated likelihood itself (now MAP poses, the integration only
-  for the test), a per-track noise model so that resolved depths become trustworthy (then the map could start at
-  slamfold's resolution instead of 1 deg of parallax);
+  for the test), a per-track noise model so that resolved depths become trustworthy (then the map could start as soon
+  as the depths are resolved instead of at 1 deg of parallax);
 - cheaper global BA: it is 1-4 s for 300-600 keyframes (the LM loop in Python competes for the GIL with tracking;
   move the whole LM into numba, fewer iterations, or only the loop's region) - the remaining latency spikes;
 - the chaos is mostly the random walk of the drift itself (max / min over start frames of a random walk's endpoint

@@ -300,7 +300,7 @@ def _refine_pose(R, t, X, uv, f, c, delta, iterations):
 @njit(cache=True, nogil=True)
 def landmark_costs(R, t, b, B, cam, uv, start, f, c, sigma, delta, rho):
   '''
-  depth-integrated landmark likelihoods (slamfold): landmark i with host bearing b_i (tangent basis B_i), inverse depth
+  depth-integrated landmark likelihoods: landmark i with host bearing b_i (tangent basis B_i), inverse depth
   rho_ig at grid node g, seen in frame j at x_ij = R_j (b_i + B_i db) + rho_ig t_j. Returns E[i, g] = -log of the
   likelihood with the bearing correction db integrated out (Laplace: the robust cost at the best db + 1/2 log det of
   its Hessian), residuals in units of sigma, Huber at delta. Observations of landmark i: start[i]:start[i + 1]
