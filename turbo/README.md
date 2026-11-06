@@ -6,21 +6,21 @@ triangulation, pose graph); the map is a handful of flat numpy tables.
 
 ```
 cd turbo
-../.venv/bin/python run.py household                     # one sequence (names: datasets.py / run.py all)
-../.venv/bin/python run.py household --rerun             # with visualization (--rerun-save x.rrd: to a file)
-../.venv/bin/python run.py all --out runs/NAME            # all sequences in parallel, then a summary table
-../.venv/bin/python run.py all --out runs/NAME --starts 0,7,14            # ensemble over start frames (use this!)
-../.venv/bin/python run.py all --out runs/X --set loop=False final_ba_iters=0   # override any Config value
-../.venv/bin/python run.py all --out runs/P --perturb 3   # every numeric parameter randomly scaled by 0.7-1.4x
-../.venv/bin/python run.py summary runs/A runs/B          # compare runs (metrics recomputed from trajectories)
-../.venv/bin/python run.py summary runs/A0+runs/A1 runs/B0+runs/B1   # ... pooled over seeds
-../.venv/bin/python run.py view runs/A/household@0       # rerun view of saved runs (alignment, errors over time)
+uv run python run.py household                                            # one sequence (names: datasets.py / run.py all)
+uv run python run.py household --rerun                                    # with visualization (--rerun-save x.rrd: to a file)
+uv run python run.py all --out runs/NAME                                  # all sequences in parallel, then a summary table
+uv run python run.py all --out runs/NAME --starts 0,7,14                  # ensemble over start frames (use this!)
+uv run python run.py all --out runs/X --set loop=False final_ba_iters=0   # override any Config value
+uv run python run.py all --out runs/P --perturb 3                         # every numeric parameter randomly scaled by 0.7-1.4x
+uv run python run.py summary runs/A runs/B                                # compare runs (metrics recomputed from trajectories)
+uv run python run.py summary runs/A0+runs/A1 runs/B0+runs/B1              # ... pooled over seeds
+uv run python run.py view runs/A/household@0                              # rerun view of saved runs (alignment, errors over time)
 ```
 
 Datasets live in `../datasets` (override with `NANOSLAM_DATASETS`): TUM RGB-D `rgbd_dataset_freiburg*/`, EuRoC
 `euroc/<name>/mav0/` (cam0 + ground truth extracted from the zips), TartanAir `tartanair/<name>_sample_P00x/P00x/`
 (left images + poses). fr1 (360, desk2, room, rpy, xyz) is the hard part: motion blur, rolling shutter, fast
-rotations; 360 / desk2 / rpy are lost after the first seconds (see Next).
+rotations; 360, desk2 and rpy lose track repeatedly (2-9% of their frames, see Results).
 
 | file | |
 |---|---|
@@ -140,7 +140,7 @@ reduced camera system is dense (Cholesky), fine for local BA and for global BA u
 updated as R <- exp(w) R, t <- t + v, so that a single translation component can be held fixed: the monocular gauge is
 7 DoF (the oldest keyframe fixed + the scale along its baseline to the next one), so the initialization pair is refined
 too (with two fixed keyframes it never is). Sim3 pose graph: LM with per-edge numerical Jacobians on local increments
-and a sparse solve (400 nodes in 0.15 s).
+and a sparse solve in a fixed sparsity pattern (25 ms on household, 51 ms for V1_02's 316 keyframes).
 
 **Evaluation** (`evaluate.py`). The estimate is Sim3-aligned to the ground truth on the *initial section* only: the
 shortest prefix (from the first tracked frame) whose ground truth covers 20% of the full extent along both main axes
@@ -164,7 +164,7 @@ runs/A0+runs/A1 runs/B0+runs/B1`). The summary gives per sequence the median ove
 sequences, the *spread* (max / min over the start frames: how chaotic it is) and a paired comparison with the first
 column (geometric mean of the per-sequence ratios with a bootstrap 95% interval, sequences better / worse). Measured
 noise floor: changing only the RANSAC seed moves the geometric mean of `final` by 6-9% (95% interval up to +-20-30%),
-so with 5 starts x 17 sequences effects below ~15% are not resolvable.
+so with 5 starts per sequence effects below ~15% are not resolvable (measured on 17 sequences).
 
 ## Results
 
@@ -172,7 +172,7 @@ so with 5 starts x 17 sequences effects below ~15% are not resolvable.
 seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
 [m], *rot* = rotation drift [deg], *ATE* = whole-trajectory alignment [m]. *full* = the default system, *VO* =
 `loop=False final_ba_iters=0` (no loop closing). One config for all 22 sequences; only the camera calibration comes
-from the dataset. (`runs/r_marg_seed*`, `runs/r_marg_vo_seed*`; the TUM fr1 sequences were added here, so the geometric
+from the dataset. (The TUM fr1 sequences were added here, so the geometric
 means are not comparable with the 17-sequence ones in the experiment log). *lost* = tracking losses (mean over the runs;
 the system's own flag: frames without map tracking, see "Lost = initializing with a map"). Poses
 are emitted from the first frame; the initial section for the alignment starts where the estimate first moves (before
@@ -216,8 +216,6 @@ translation is established positions are held, see Initialization).
 - For orientation only (the numbers vary between papers): ORB-SLAM3 monocular on EuRoC is reported at MH_01
   1.6-2.9 cm, MH_04 8.5-13.8 cm, V2_03 36-52 cm or a failure ([1](https://arxiv.org/pdf/2405.03413),
   [2](https://arxiv.org/pdf/2012.11863), [3](https://arxiv.org/pdf/2405.13748)).
-- The human-written `nanoslam.py` on household, same evaluation (live, 20%), starts 0 / 7 / 14: final 0.084 /
-  0.367 / 0.560, ATE 0.044 / 0.134 / 0.173 (turbo: final 0.013 full, 0.152 VO).
 - `drift` (all frames, initial-section alignment) is dominated by the alignment lever arm: a degree of error in the
   initial section's orientation makes tens of cm at the far end; `rot` measures the rotation drift without it.
 - Speed (single process, M5 Pro, full system): household 144 fps, MH_01 120, MH_03 58, V2_02 57, V1_02 52.
@@ -238,7 +236,7 @@ translation is established positions are held, see Initialization).
   (~130 ms on desk2; `reloc_max_hypotheses=4`: ~18 ms, neutral on the benchmark). (The table predates both.)
 - Robustness to the parameters (first round, hindsight ATE, single runs, lost frames not scored): 4 random
   perturbations of *all* numeric parameters (each scaled by 0.7-1.4x): geometric mean ATE 1.9-2.4 cm vs 2.3 cm with
-  the defaults (`runs/v5_perturb*`) - i.e. within the noise floor measured later.
+  the defaults - i.e. within the noise floor measured later.
 
 ## What was tried
 
