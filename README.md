@@ -6,7 +6,13 @@
 
 **Getting started:** Make a directory `datasets`, download the `fr3/long_office_household` from [TUM RGB-D dataset download page](https://cvg.cit.tum.de/data/datasets/rgbd-dataset/download#freiburg3_long_office_household) and extract it.
 
+```bash
+(mkdir datasets && cd datasets && wget https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_long_office_household.tgz && tar -xzf rgbd_*)
 ```
+
+Then run `nanoslam`.
+
+```bash
 uv sync
 uv run python nanoslam.py household --rerun
 ```
@@ -16,7 +22,7 @@ uv run python nanoslam.py household --rerun
 
 The main loop (implemented in `on_frame`) is really simple, you should read it!
 
-This algorithm is inspired by [OV²SLAM](https://arxiv.org/abs/2102.04060) but significantly simplified. It doesn't feature loop closure via place recognition but relocalization can be adapted to perform loop closure by reprojection of old 3D points. Still, it is accurate enough to complete `fr3/long_office_household` with a drift of only 7cm.  The current parameters are somewhat fine-tuned to that sequence but with a few tweaks, it can be generalized.
+This algorithm is inspired by [OV²SLAM](https://arxiv.org/abs/2102.04060) but significantly simplified. It doesn't feature loop closure via place recognition but relocalization can be adapted to perform loop closure by reprojection of old 3D points. Still, it is accurate enough to complete `fr3/long_office_household` without getting lost, with a drift between 7-40cm. The current parameters are somewhat fine-tuned to that sequence but with a few tweaks, it can be generalized.
 
 
 <p align="center"><img src="assets/freiburg3_long_office_household.png"/><p>

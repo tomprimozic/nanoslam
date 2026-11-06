@@ -52,7 +52,7 @@ class Dataset:
     'cx': 320.1,
     'cy': 247.6,
   }
-  
+
   def __init__(self, path: str | Path):
     self.path = Path(path)
     images = pd.read_csv(self.path / 'rgb.txt', sep=' ', comment='#', names=['timestamp', 'filename'])
@@ -400,8 +400,8 @@ class Config:
 
   abs_max_reproj_error = 3.0
 
-  reloc_window = 8
-  reloc_min_points = 100
+  reloc_window = 16
+  reloc_min_points = 120
   reloc_border = 1
   reloc_max_iter = 100
   reloc_eps = 0.1
@@ -453,7 +453,7 @@ class SLAM:
     self.keyframes = {}
     self.keyframe = None
 
-  
+
   def track_lk(self):
     config = self.config
     frame = self.frames[-1]
@@ -642,7 +642,7 @@ class SLAM:
       win_size = (config.feat_subpix_win_size, config.feat_subpix_win_size)
       criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, config.feat_subpix_max_iter, config.feat_subpix_eps)
       uvs = cv2.cornerSubPix(img, uvs, win_size, (-1, -1), criteria)
-    
+
     for uv in uvs:
       u, v = uv
       color = keyframe.frame.img[int(v), int(u)]
@@ -731,7 +731,7 @@ class SLAM:
       self.detect_keypoints()
       self.local_bundle_adjustment()
 
-    age3d = np.median([pt.age for pt in self.points if pt.is_3d])
+    age3d = np.median([pt.age for pt in self.points if pt.is_3d] or [0])
     self.metrics['age3d'] = int(age3d) if np.isfinite(age3d) else None
 
 
