@@ -76,6 +76,42 @@ def sample_template(src, us, vs, A, scale_src, scale_tgt, half, T):
 
 
 @njit(cache=True, nogil=True)
+def search_zncc(tgt, x, y, half, search_px, template, tile):
+  '''integer-offset search: overlapping patches share one sub-pixel sampling grid'''
+  P = 2 * half + 1
+  side = P + 2 * search_px
+  for i in range(side):
+    for j in range(side):
+      u, v = x - search_px - half + j, y - search_px - half + i
+      tile[i, j] = bilinear(tgt, u, v) if inside(tgt, u, v, 0) else 0.0
+  template_sum = 0.0
+  for i in range(P):
+    for j in range(P):
+      template_sum += template[i, j]
+  best, bx, by = -2.0, x, y
+  for oy in range(-search_px, search_px + 1):
+    for ox in range(-search_px, search_px + 1):
+      u, v = x + ox, y + oy
+      if not inside(tgt, u - half, v - half, 0) or not inside(tgt, u + half, v + half, 0):
+        continue
+      s, ss, cross = 0.0, 0.0, 0.0
+      for i in range(P):
+        for j in range(P):
+          value = tile[oy + search_px + i, ox + search_px + j]
+          s += value
+          ss += value * value
+          cross += value * template[i, j]
+      mean = s / P ** 2
+      std = np.sqrt(max(ss / P ** 2 - mean * mean, 0.0))
+      if std < 1.0:
+        continue
+      corr = (cross - mean * template_sum) / std
+      if corr > best:
+        best, bx, by = corr, u, v
+  return bx, by
+
+
+@njit(cache=True, nogil=True)
 def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, search_px, half, max_iter):
   '''
   src_pyr: pyramids of all source keyframes (a tuple of (n_keyframes, h, w) uint8 arrays, one per level), src_index:
@@ -94,6 +130,7 @@ def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, s
   gx = np.empty((P, P))
   gy = np.empty((P, P))
   I = np.empty((P, P))
+  search_tile = np.empty((P + 2 * search_px, P + 2 * search_px)) if search_px > 0 else np.empty((0, 0))
   n_src = len(src_pyr)
   for k in range(n):
     footprint = np.sqrt(abs(A[k, 0, 0] * A[k, 1, 1] - A[k, 0, 1] * A[k, 1, 0]))
@@ -134,18 +171,7 @@ def align_patches(src_pyr, src_index, tgt_pyr, uv_src, A, uv_guess, top_level, s
         break
 
       if level == top_level and search_px > 0:
-        # brute-force ZNCC search (integer offsets) around the guess
-        best, bx, by = -2.0, x, y
-        for oy in range(-search_px, search_px + 1):
-          for ox in range(-search_px, search_px + 1):
-            if sample_normalized(tgt, x + ox, y + oy, half, I):
-              c = 0.0
-              for i in range(P):
-                for j in range(P):
-                  c += I[i, j] * Tn[i, j]
-              if c > best:
-                best, bx, by = c, x + ox, y + oy
-        x, y = bx, by
+        x, y = search_zncc(tgt, x, y, half, search_px, Tn, search_tile)
 
       for it in range(max_iter):
         if not sample_normalized(tgt, x, y, half, I):

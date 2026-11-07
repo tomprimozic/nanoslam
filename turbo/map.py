@@ -135,6 +135,12 @@ class Map:
     counts[kf] = 0
     return counts
 
+  def covisibility_rows(self, kfs):
+    '''(len(kfs), n_kfs) sparse rows of covisibility_matrix() for these keyframes only (the full product is O(map))'''
+    o = np.flatnonzero(self.obs.alive & (self.pts.state[self.obs.pt] == MAPPED))
+    A = scipy.sparse.csr_matrix((np.ones(len(o)), (self.obs.kf[o], self.obs.pt[o])), shape=(len(self.kfs), len(self.pts)))
+    return (A[np.asarray(kfs)] @ A.T).tocsr()
+
   def covisibility_matrix(self):
     '''(n_kfs, n_kfs) sparse matrix of shared mapped points'''
     o = np.flatnonzero(self.obs.alive & (self.pts.state[self.obs.pt] == MAPPED))

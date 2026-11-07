@@ -1046,12 +1046,12 @@ class SLAM:
     candidates = [k for k in candidates if 1 < k < kf - 2 and m.kfs.alive[k] and k not in keep]
     if not candidates:
       return
-    C = m.covisibility_matrix()
-    n_points = C.diagonal()
-    for k in candidates:
-      j, shared = C.indices[C.indptr[k]:C.indptr[k + 1]], C.data[C.indptr[k]:C.indptr[k + 1]]
-      older = j[(j < k) & (shared >= c.cull_kf_shared * n_points[k]) & m.kfs.alive[j]]
-      if n_points[k] < c.kf_min_3d or len(older) == 0:
+    C = m.covisibility_rows(candidates)       # (only the candidates' rows: the full matrix is O(map))
+    for r, k in enumerate(candidates):
+      j, shared = C.indices[C.indptr[r]:C.indptr[r + 1]], C.data[C.indptr[r]:C.indptr[r + 1]]
+      n_points_k = shared[j == k].sum()
+      older = j[(j < k) & (shared >= c.cull_kf_shared * n_points_k) & m.kfs.alive[j]]
+      if n_points_k < c.kf_min_3d or len(older) == 0:
         continue
       depth = np.median(transform(m.kfs.T[k], m.pts.X[m.points_of(k)])[:, 2])
       dist = np.linalg.norm(camera_center(m.kfs.T[older]) - camera_center(m.kfs.T[k]), axis=1)

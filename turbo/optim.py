@@ -44,13 +44,17 @@ def robust_cost(e2, delta):
 @njit(cache=True, nogil=True)
 def reprojection_cost(R, t, X, cam, pt, uv, f, c, delta):
   cost = 0.0
-  for o in range(len(cam)):
-    Xc = R[cam[o]] @ X[pt[o]] + t[cam[o]]
-    if Xc[2] <= 1e-9:
+  for o in range(len(cam)):     # (scalar: R[k] @ X[p] would allocate per observation, ~20x slower)
+    k, p = cam[o], pt[o]
+    x0, x1, x2 = X[p, 0], X[p, 1], X[p, 2]
+    z = R[k, 2, 0] * x0 + R[k, 2, 1] * x1 + R[k, 2, 2] * x2 + t[k, 2]
+    if z <= 1e-9:
       cost += BEHIND
       continue
-    rx = f[0] * Xc[0] / Xc[2] + c[0] - uv[o, 0]
-    ry = f[1] * Xc[1] / Xc[2] + c[1] - uv[o, 1]
+    x = R[k, 0, 0] * x0 + R[k, 0, 1] * x1 + R[k, 0, 2] * x2 + t[k, 0]
+    y = R[k, 1, 0] * x0 + R[k, 1, 1] * x1 + R[k, 1, 2] * x2 + t[k, 1]
+    rx = f[0] * x / z + c[0] - uv[o, 0]
+    ry = f[1] * y / z + c[1] - uv[o, 1]
     cost += robust_cost(rx * rx + ry * ry, delta)
   return cost
 
@@ -71,8 +75,11 @@ def linearize(R, t, X, cam, pt, uv, free, mask, f, c, delta, n_free):
   Jc = np.zeros((2, 6))
   for o in range(len(cam)):
     k, p = cam[o], pt[o]
-    Y = R[k] @ X[p]
-    x, y, z = Y[0] + t[k, 0], Y[1] + t[k, 1], Y[2] + t[k, 2]
+    x0, x1, x2 = X[p, 0], X[p, 1], X[p, 2]     # (scalar: no allocation per observation)
+    Y0 = R[k, 0, 0] * x0 + R[k, 0, 1] * x1 + R[k, 0, 2] * x2
+    Y1 = R[k, 1, 0] * x0 + R[k, 1, 1] * x1 + R[k, 1, 2] * x2
+    Y2 = R[k, 2, 0] * x0 + R[k, 2, 1] * x1 + R[k, 2, 2] * x2
+    x, y, z = Y0 + t[k, 0], Y1 + t[k, 1], Y2 + t[k, 2]
     if z <= 1e-9:
       continue
     r0 = f[0] * x / z + c[0] - uv[o, 0]
@@ -82,8 +89,8 @@ def linearize(R, t, X, cam, pt, uv, free, mask, f, c, delta, n_free):
     a00, a02 = f[0] / z, -f[0] * x / z ** 2
     a11, a12 = f[1] / z, -f[1] * y / z ** 2
     # pose: d Xc / d w = -[R X]x, d Xc / d v = I
-    Jc[0, 0], Jc[0, 1], Jc[0, 2] = a02 * Y[1], a00 * Y[2] - a02 * Y[0], -a00 * Y[1]
-    Jc[1, 0], Jc[1, 1], Jc[1, 2] = -a11 * Y[2] + a12 * Y[1], -a12 * Y[0], a11 * Y[0]
+    Jc[0, 0], Jc[0, 1], Jc[0, 2] = a02 * Y1, a00 * Y2 - a02 * Y0, -a00 * Y1
+    Jc[1, 0], Jc[1, 1], Jc[1, 2] = -a11 * Y2 + a12 * Y1, -a12 * Y0, a11 * Y0
     Jc[0, 3], Jc[0, 4], Jc[0, 5] = a00, 0.0, a02
     Jc[1, 3], Jc[1, 4], Jc[1, 5] = 0.0, a11, a12
     # point: d Xc / d X = R
@@ -253,12 +260,16 @@ def bundle_adjust(K, T_cw, fixed, X, cam, pt, uv, iterations=10, delta=HUBER, sc
 @njit(cache=True, nogil=True)
 def squared_errors(R, t, X, cam, pt, uv, f, c):
   e2 = np.empty(len(cam))
-  for o in range(len(cam)):
-    Xc = R[cam[o]] @ X[pt[o]] + t[cam[o]]
-    if Xc[2] <= 1e-9:
+  for o in range(len(cam)):     # (scalar: no allocation per observation)
+    k, p = cam[o], pt[o]
+    x0, x1, x2 = X[p, 0], X[p, 1], X[p, 2]
+    z = R[k, 2, 0] * x0 + R[k, 2, 1] * x1 + R[k, 2, 2] * x2 + t[k, 2]
+    if z <= 1e-9:
       e2[o] = np.inf
     else:
-      e2[o] = (f[0] * Xc[0] / Xc[2] + c[0] - uv[o, 0]) ** 2 + (f[1] * Xc[1] / Xc[2] + c[1] - uv[o, 1]) ** 2
+      x = R[k, 0, 0] * x0 + R[k, 0, 1] * x1 + R[k, 0, 2] * x2 + t[k, 0]
+      y = R[k, 1, 0] * x0 + R[k, 1, 1] * x1 + R[k, 1, 2] * x2 + t[k, 1]
+      e2[o] = (f[0] * x / z + c[0] - uv[o, 0]) ** 2 + (f[1] * y / z + c[1] - uv[o, 1]) ** 2
   return e2
 
 
@@ -268,9 +279,11 @@ def _refine_pose(R, t, X, uv, f, c, delta, iterations):
     H = np.zeros((6, 6))
     g = np.zeros(6)
     J = np.zeros((2, 6))
-    for o in range(len(X)):
-      Xc = R @ X[o] + t
-      x, y, z = Xc[0], Xc[1], Xc[2]
+    for o in range(len(X)):     # (scalar: no allocation per observation)
+      x0, x1, x2 = X[o, 0], X[o, 1], X[o, 2]
+      x = R[0, 0] * x0 + R[0, 1] * x1 + R[0, 2] * x2 + t[0]
+      y = R[1, 0] * x0 + R[1, 1] * x1 + R[1, 2] * x2 + t[1]
+      z = R[2, 0] * x0 + R[2, 1] * x1 + R[2, 2] * x2 + t[2]
       if z <= 1e-9:
         continue
       r0 = f[0] * x / z + c[0] - uv[o, 0]
