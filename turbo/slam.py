@@ -82,8 +82,13 @@ class Config:
   kf_tracked_ratio = 0.7
   kf_min_3d = 40
 
-  # local BA
-  ba_window = 10
+  # local BA: the new keyframe and the keyframes sharing >= ba_min_covisible points with it (ORB-SLAM's covisibility
+  # window) are optimized, every other keyframe observing their points is held fixed. ba_window caps the free keyframes
+  # (most covisible first). 250 is above the largest window on EuRoC / TUM (217 free keyframes, V2_02), so there it is
+  # the whole covisibility window: local in large scenes, most of the map in small, often revisited ones (a room), where
+  # keyframes keep being refined by later observations instead of only in their first ~2 s (live final drift 0.70x vs
+  # a window of 10); on larger maps it is the cap. Also the neighbourhood for relocalization and keyframe culling
+  ba_window = 250
   ba_min_covisible = 15
   ba_iters = 10
 
@@ -120,6 +125,10 @@ class Config:
   cull_keyframes = True
   cull_kf_shared = 0.8              # near-duplicate keyframes: fraction of shared points,
   cull_kf_angle = 10.0              # deg, and orientation difference (and closer than the keyframe parallax)
+  cull_redundant = True             # also drop covisible keyframes older than cull_redundant_age keyframes whose points
+  cull_redundant_age = 20           # are (almost) all seen by >= 3 other keyframes (ORB-SLAM's rule, outside the recent
+  cull_redundant_ratio = 0.98       # past): ~ORB-SLAM's keyframe density (2.5x fewer), keeps the covisibility window
+  cull_redundant_min_obs = 4        # small; 0.95 is already too aggressive (map and live accuracy)
   ransac_seed = 0
 
 
@@ -171,6 +180,7 @@ class SLAM:
                        flow=(np.float32, (), np.nan), blur=(np.float32, (), np.nan), lost=(np.int32, (), 0),
                        keyframe=(bool, (), False), loop_search=(bool, (), False), loop_closed=(bool, (), False),
                        keyframes=(np.int32, (), 0), points=(np.int32, (), 0),
+                       ba_free=(np.int32, (), 0), ba_fixed=(np.int32, (), 0), ba_obs=(np.int32, (), 0),
                        ms=(np.float32, (), np.nan))
     self.diag = {}
     self.events = []
@@ -910,13 +920,14 @@ class SLAM:
     '''the new keyframe and its most covisible ones; all other keyframes that see their points are held fixed'''
     c, m = self.c, self.map
     covis = m.covisibility(kf)
-    order = np.argsort(-covis)
-    window = np.r_[kf, order[:c.ba_window - 1][covis[order[:c.ba_window - 1]] >= c.ba_min_covisible]]
+    order = np.argsort(-covis)[:c.ba_window - 1]
+    window = np.r_[kf, order[covis[order] >= c.ba_min_covisible]]
     pts = np.unique(m.obs.pt[m.obs_of(kfs=window)])
     pts = pts[m.pts.state[pts] == MAPPED]
     o = m.obs_of(pts=pts)
     kfs = np.unique(m.obs.kf[o])
     fixed = ~np.isin(kfs, window)
+    self.diag |= {'ba_free': int((~fixed).sum()), 'ba_fixed': int(fixed.sum()), 'ba_obs': len(o)}
     self.bundle_adjust(kfs, fixed, pts, o, c.ba_iters)
 
   def global_ba(self, iters, delay=0):
@@ -1059,6 +1070,19 @@ class SLAM:
       if np.any((dist < np.tan(np.deg2rad(c.kf_parallax)) * depth) & (angle < c.cull_kf_angle)):
         self.remove_keyframe(k)
 
+  def cull_redundant_keyframes(self, kf):
+    '''covisible keyframes older than cull_redundant_age whose points are (almost) all seen by >= 3 other keyframes'''
+    c, m = self.c, self.map
+    keep = self.provisional[:2] if self.provisional is not None else ()     # (merge_provisional relies on them)
+    candidates = np.flatnonzero(m.covisibility(kf) > 0)
+    for k in candidates:
+      if not (1 < k < kf - c.cull_redundant_age and m.kfs.alive[k] and k not in keep):
+        continue
+      p = m.points_of(k)
+      if len(p) and np.mean(m.pts.n_obs[p] >= c.cull_redundant_min_obs) >= c.cull_redundant_ratio:
+        self.counts['cull_redundant'] += 1
+        self.remove_keyframe(k)
+
   def remove_keyframe(self, k):
     m = self.map
     parent = m.kfs.parent[k]
@@ -1105,6 +1129,8 @@ class SLAM:
       self.cull_points(kf)
     if c.cull_keyframes:
       self.cull_keyframes(kf, self.local_keyframes(kf, c.ba_window)[1:])
+    if c.cull_redundant:
+      self.cull_redundant_keyframes(kf)
     m.compact_obs()
     with self.timed('detect'):
       self.detect(kf)

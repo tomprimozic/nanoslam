@@ -53,7 +53,7 @@ def perturbed(seed, factor=1.4):
     if k.startswith('_') or isinstance(v, bool) or not isinstance(v, (int, float)) or k in ('ransac_seed',):
       continue
     f = np.exp(rng.uniform(-np.log(factor), np.log(factor)))
-    x = 1 - (1 - v) * f if 'ncc' in k else v * f      # correlation thresholds: perturb the distance to 1
+    x = 1 - (1 - v) * f if 'ncc' in k or k == 'cull_redundant_ratio' else v * f      # correlation / redundancy thresholds: perturb the distance to 1
     overrides.append(f'{k}={max(1, round(x)) if isinstance(v, int) else round(x, 4)}')
   return overrides
 
