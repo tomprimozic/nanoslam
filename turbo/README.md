@@ -117,12 +117,21 @@ keyframe their patch comes from.
    that saw it from the most similar viewpoint; found points are *fused* with a track at the same place (duplicates
    merged, the point with more observations survives) or become tracks again (long tracks = less drift);
 3. triangulate candidates (multi-view, from all their keyframe observations);
-4. local BA: the keyframe and its 9 most covisible ones; every other keyframe observing their points is held fixed;
-   outliers (chi2, behind the camera) are removed;
+4. local BA over the *covisibility window* (as ORB-SLAM's): the keyframe and every keyframe sharing >= 15 points with
+   it are optimized, every other keyframe observing their points is held fixed; outliers (chi2, behind the camera) are
+   removed. This is local in large scenes but most of the map in small, often revisited ones (on V1_02 a median of 58
+   free and 79 fixed keyframes, ~30k observations; `stats_ba_*` in the runs). What it buys: with the old window (the 9
+   most covisible keyframes) a keyframe was optimized ~12 times, all within ~2 s of its creation, and then frozen
+   until a loop closure, although later keyframes keep observing its points from longer baselines; with the
+   covisibility window it is optimized ~150 times (MH_03) and moves by ~20% of a keyframe step over its life (p90: 80%).
+   `ba_window` (250) caps the free keyframes, most covisible first: above the largest window on EuRoC / TUM (217,
+   V2_02), a cap for larger maps (50 kept about half the gain);
 5. loop detection (below);
 6. culling: points rarely found when they should be visible (ORB-SLAM's found / visible ratio) or seen by <= 2
    keyframes; keyframes that are near-duplicates of an older one (same place, orientation and points: revisits,
-   hovering);
+   hovering); *redundant* keyframes older than 20 keyframes whose points are >= 98% seen by >= 3 other keyframes
+   (ORB-SLAM's rule outside the recent past: tracking needs the dense recent keyframes, BA does not need the old
+   ones). This keeps ~ORB-SLAM's density (MH_03: 172 of ~570 keyframes) and the covisibility window affordable;
 7. new corners in empty grid cells (the strongest min-eigenvalue corner per cell).
 
 **Loops by projection** (no place recognition). At every 3rd keyframe, points not seen for 20 keyframes are searched
@@ -147,6 +156,17 @@ shortest prefix (from the first tracked frame) whose ground truth covers 20% of 
 (a trajectory spanning 20 x 10 m is aligned on the prefix that spans 4 x 2 m). Poses are the *live* ones (as estimated
 at that frame); `--trajectory final` uses the keyframe poses with hindsight (after later loop closures / final BA).
 
+*Rolling re-alignment.* The system keeps revising its estimate of the initial section (local / global BA, loop
+closures), and a live pose at frame t is expressed in the map as it was at t. So each live pose is aligned with the
+system's estimate *at that time* of the initial section: runs save a snapshot of it every 20 frames (`snap_*` in
+`trajectory.npz`). Aligning with the live poses of the section, frozen when they were made, counted every later
+refinement of the start of the map as error at the end: a system that corrects its start (as a loop closure should)
+was penalized, one that anchors it (holding the first keyframes fixed: 30% "better") rewarded. This is still not
+post-hoc alignment (nothing from after frame t is used, the whole trajectory never enters it). Each frame of the
+section has a latest known position: its live pose, updated by every later snapshot (without snapshots it stays the
+live pose: the plain initial-section alignment); frames up to the end of the section use the positions known then.
+The frozen alignment overstated turbo's `final` by ~30%.
+
 - `final` (headline): RMSE over the last 10% of frames
 - `rot`: rotation drift, RMS over the last 10% of frames of the error of the rotation since the end of the initial
   section (deg; independent of the alignment)
@@ -167,6 +187,9 @@ noise floor: changing only the RANSAC seed moves the geometric mean of `final` b
 so with 5 starts per sequence effects below ~15% are not resolvable (measured on 17 sequences).
 
 ## Results
+
+*To be re-run:* the table below predates the covisibility window, the redundant-keyframe culling and the rolling
+re-alignment (the third round of "What was tried" has the comparisons on 13 sequences).
 
 *Live* poses (as estimated at each frame), median over 10 runs per sequence (start frames 0, 5, 10, 15, 20 x RANSAC
 seeds 0, 1), 20% coverage alignment, lost frames scored with the last pose. *final* = RMSE of the last 10% of frames
@@ -301,6 +324,41 @@ changing only the RANSAC seed gives 1.09 [0.98, 1.20] (VO) and 1.06 [0.89, 1.32]
 | V1_01's 3 deg early rotation error (both initializations) | not the focal length (3.1-3.3 deg for 0.97-1.02x); half is a constant 1.6 deg camera-frame roll offset vs the ground truth (hand-eye fit), specific to that sequence | open |
 | evaluation: initial-section alignment from the hindsight poses (applied to the live ones; `evaluate(align_est=)`) | VO: no change (final 0.254 vs 0.254); full: final 0.067 vs 0.075 but start spread 3.8 vs 2.7, drift worse (pose graphs move the early keyframes, so the two are in different frames) | kept live |
 | our BA vs Ceres (pycolmap) on the same 359-keyframe problem, 1 thread, 10 iterations | ours 3.1 s, Ceres 4.8 (sparse Schur) - 6.6 s (dense Schur), same cost | - |
+
+Third round (Linux, i7-8700; 13 sequences: TUM fr2/desk, fr3/household, EuRoC; 5 start frames x 2 seeds; ratios vs
+the default at the time, 95% interval, sequences better / worse; *live final* is with the frozen alignment unless
+marked *rolling*; fps single process). It started from a comparison with ORB-SLAM2/3, pySLAM, OV²SLAM and DSO on
+the same frames and evaluation (all monocular, slambench): turbo was best on hindsight ATE everywhere, but ORB-SLAM2
+had lower *live* drift over ~5 m on the Machine Hall sequences (relative pose error over 5 m of path: 1.43% vs
+1.60%). LK is the more precise tracker (over 1 m: 2.6% vs 3.0%, 0.26 vs 0.32 deg/m), so the question was what ORB-SLAM
+does with its map that turbo does not.
+
+| change | effect | |
+|---|---|---|
+| keyframe rotations re-projected onto SO(3) after BA, merges, pose graph | they drifted off over repeated global-BA merges (`inv_pose` assumes R orthonormal, each merge amplified the error: 1e-7 -> 1e-3 -> entries ~100, then the pose graph divided by a zero scale); neutral on the benchmark (final 0.99, rotation 0.99, ATE 1.00) | fixed |
+| pose graph also for small loop disagreements (`loop_min_correction` 2 / 0 px instead of 5) | live final 1.44 [1.07, 2.00] / 2.49 [1.61, 4.07], rotation 1.35 / 1.45; hindsight ATE 0.95 / 0.97; 20% / 2.6x slower: every correction jumps the live pose | no |
+| old-point search at every keyframe (`loop_every=1`) | live final 1.00, rotation 1.11 [1.03, 1.22]; hindsight final 0.97 [0.94, 0.99]; with the 0 px threshold 4.4x worse | no |
+| on a small loop disagreement the keyframe and live pose take the old points' PnP pose before fusing (ORB-SLAM re-registers to its old map on revisits; MH_04 keeps a 5-14 cm offset after returning to the start where ORB-SLAM2 has 1-4 cm) | live final 1.00 [0.91, 1.09]; MH_04 unchanged | removed |
+| track the local map every frame (restored), alone / with the PnP snap | live final 1.12 [0.95, 1.30] / 1.08; 5 m live drift 1.64% (was 1.60%): neutral live too, the first verdict was on hindsight poses | removed |
+| re-measure every frame from the reference keyframes, refine the live pose (KLT drift between keyframes) | live final 1.01 [0.90, 1.14], 5 m live drift 1.62% | removed |
+| more keyframes / fewer (`kf_parallax` 1.25 / 2.5 / 3.5; turbo already keeps 1.5-3x ORB-SLAM's keyframes) | 1.25: live final 1.06, hindsight ATE 0.92 [0.86, 0.96], 35% slower; 2.5 / 3.5: live rotation 1.16 [1.02, 1.35] / 1.11, hindsight final 1.15: creating fewer keyframes hurts tracking | 1.75 |
+| more corners (`cells` 30 / 40; 260 cells, ~400 tracks per frame now) | hindsight ATE 0.89 [0.76, 0.98] / 0.84 [0.68, 0.95], 5 m live drift 1.56% / 1.46%; live final 0.97 / 1.06, rotation 1.10 / 1.02; 2x / 3x slower | 20 (cost) |
+| bigger local BA window (10 -> 20 / 30 / 50 most covisible) | live ATE 0.95 [0.91, 0.99] / 0.95 / 0.93 [0.87, 0.99], hindsight ATE 0.94 / 0.95 / 0.92, 5 m live drift 1.54 / 1.53 / 1.53%: grows with the window | -> |
+| **covisibility window** (all keyframes sharing >= 15 points) | *rolling* live final **0.68 [0.53, 0.84]** (10 / 3), live ATE 0.86 [0.76, 0.95], hindsight final 0.80 [0.66, 0.93], hindsight ATE 0.86 [0.78, 0.94], 5 m live drift 1.44% (= ORB-SLAM2); 4x slower (MH_01 10.7 fps, 19 s worst frame); frozen-alignment live final 1.08: hidden by the evaluation (it moves the start of the map) | with culling |
+| ... with 5 iterations / >= 5 shared points / 30 cells | 5 iterations: the same accuracy, barely faster (the cost is the problem size); >= 5 points: neutral; 30 cells: a further 0.92 [0.87, 0.97] live final, 0.89 hindsight ATE, but another 2.5x slower | - |
+| ... in a background thread on a snapshot merged 40 frames later / instead a background global BA every 10 keyframes | vs the covisibility window: live final 1.19 [1.03, 1.40] / 1.08, hindsight ATE 1.07 / 1.11; about the default's speed: the refinement has to reach the map before it is used | no |
+| **... plus culling redundant keyframes** (>= 98% of the points seen by >= 3 others, older than 20 keyframes; restored ORB-SLAM rule, candidates now from the whole covisibility window) | *rolling* live final **0.70 [0.56, 0.84]** (10 / 3), live ATE 0.88 [0.78, 0.97], hindsight final 0.84, hindsight ATE 0.96; keyframes 446 -> 172; 12.6 fps under load vs 15.7 (the covisibility window alone 2.9) | adopted |
+| ... culling at 95% / 90% / 80%, or after >= 20 local BAs | 95%: 104 keyframes, faster than the default but live 1.01, hindsight ATE 1.24 [0.96, 1.69]; 90% / 80% (single runs): 66 / 46 keyframes, 80% breaks the map; after 20 BAs: live final 1.48 [1.03, 2.19], hindsight ATE 1.23; only once converged (moving average of the BA displacement): as 98% | 98% |
+| hold the first 20 keyframes fixed in every optimization (the start of the map as the reference) | frozen-alignment live final 0.70 on one seed, *rolling* 1.04 and MH_04 1.5x worse: it only won against the evaluation's frozen alignment | removed |
+| evaluation: rolling re-alignment of the initial section (see Evaluation) | the default's `final` 0.036 -> 0.025 m (geometric mean; V1_03 0.082 -> 0.016, V2_03 0.235 -> 0.078); the baselines gain as well (ORB-SLAM2 on V1_02 0.042 -> 0.025) | adopted |
+| speed: BA / pose kernels without the per-observation `R @ X` (numba allocates a 3-vector each time); culling computes only its candidates' covisibility rows (the full keyframe x keyframe product was O(map)); the wide ZNCC search samples one tile for all offsets | cost evaluation 21x, local BA 5.3x faster, results identical to 1e-15 / bit-identical; single process MH_01 40 -> 65 fps, V1_02 19 -> 34 fps (keyframe frames 132 -> 63 ms mean on MH_01); accuracy 0.93 [0.87, 1.00] (rounding) | adopted |
+| one polar Newton step instead of the SVD for the SO(3) re-projection | 0.02 vs 0.33 ms per 200 poses, < 0.5% of a run; different rounding (an extra loop closure on V1_02) | deferred |
+
+What the analysis showed along the way: ORB-SLAM's live advantage was its local BA's scope (KLT drift between
+keyframes, keyframe density and local-map tracking were ruled out; descriptors were not needed); in the default the
+10-keyframe window spans only ~2 s with turbo's dense keyframes. The remaining gap is the re-registration on
+revisits (MH_04: ORB-SLAM3 0.027 m vs 0.029 rolling final). How far the start of the map moves after the fact
+predicts the frozen-alignment `final` (rank correlation 0.79): the reason for the rolling re-alignment.
 
 Where the error comes from: rotation error at the end is 90-100% *systematic* (the same for all start frames) on
 almost every sequence; part of it is the orientation of the initial-section alignment (V1_01: 6 deg right after the
