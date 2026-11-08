@@ -71,6 +71,25 @@ def lost_flags(n, frames, lost):
   return flags
 
 
+SNAP_EVERY, SNAP_SUB = 20, 5
+
+
+def start_snapshot(slam, idx):
+  '''the system's current estimate (keyframe-relative, as in poses(online=False)) of the frames idx: positions, NaN where
+  none yet (rolling re-alignment of the initial section in the evaluation)'''
+  tr = slam.traj
+  pos = np.full((len(idx), 3), np.nan, np.float32)
+  lookup = np.full(idx[-1] + 1, -1)
+  lookup[idx] = np.arange(len(idx))
+  f = tr.frame
+  sel = (f >= 0) & (f <= idx[-1])
+  sel[sel] &= lookup[f[sel]] >= 0
+  if sel.any():
+    T = geometry.inv_pose(tr.T[sel] @ slam.map.kfs.T[tr.ref[sel]])
+    pos[lookup[f[sel]]] = T[:, :3, 3]
+  return pos
+
+
 def run(name, config, out=None, start=0, max_frames=None, rerun=None, quiet=False):
   '''rerun: None, 'spawn' (a viewer) or the path of a recording'''
   cv2.setNumThreads(1)
@@ -78,12 +97,22 @@ def run(name, config, out=None, start=0, max_frames=None, rerun=None, quiet=Fals
   stop = len(data) if max_frames is None else min(len(data), start + max_frames)
   slam = SLAM(config, data.K, data.width, data.height)
   view = View(data, start, stop, slam.K, None if rerun == 'spawn' else rerun) if rerun else None
+  # snapshots of the start of the trajectory as the system knows it, every SNAP_EVERY frames (every SNAP_SUB-th frame
+  # of the first ones: generously more than the initial section of the evaluation)
+  gt_pos = data.gt[start:stop, :3, 3]
+  ok_gt = np.isfinite(gt_pos).all(axis=1)
+  n_init = evaluate.initial_section(gt_pos[ok_gt]) if ok_gt.sum() >= 10 else stop - start
+  snap_idx = np.arange(0, min(stop - start, 2 * n_init + 300), SNAP_SUB)
+  snap_frames, snap_pos = [], []
   t0 = time.perf_counter()
   latency = []
   for i, img in data.images(start, stop):
     t = time.perf_counter()
     slam.on_frame(i - start, img)
     latency.append(time.perf_counter() - t)
+    if (i - start) % SNAP_EVERY == SNAP_EVERY - 1 or i == stop - 1:
+      snap_frames.append(i - start)
+      snap_pos.append(start_snapshot(slam, snap_idx))
     if view is not None:
       view.frame(slam, i, img)
     if not quiet and (i - start) % 500 == 0:
@@ -95,7 +124,8 @@ def run(name, config, out=None, start=0, max_frames=None, rerun=None, quiet=Fals
   gt, gt_R = data.gt[start:stop, :3, 3], data.gt[start:stop, :3, :3]
   lost = lost_flags(n, slam.stats.frame, slam.stats.lost)
   m_final = evaluate.evaluate(T_final[:, :3, 3], gt, est_R=T_final[:, :3, :3], gt_R=gt_R, lost=lost)
-  m_online = evaluate.evaluate(T_online[:, :3, 3], gt, est_R=T_online[:, :3, :3], gt_R=gt_R, lost=lost)
+  snapshots = (np.array(snap_frames), snap_idx, np.array(snap_pos))
+  m_online = evaluate.evaluate(T_online[:, :3, 3], gt, est_R=T_online[:, :3, :3], gt_R=gt_R, lost=lost, snapshots=snapshots)
   events = {}
   for e in slam.events:
     events[e['type']] = events.get(e['type'], 0) + 1
@@ -111,7 +141,7 @@ def run(name, config, out=None, start=0, max_frames=None, rerun=None, quiet=Fals
   if out is not None:
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / 'trajectory.npz', final=T_final[:, :3, 3], online=T_online[:, :3, 3], gt=gt, poses=T_final,
-             online_poses=T_online,
+             online_poses=T_online, snap_frames=np.array(snap_frames), snap_idx=snap_idx, snap_pos=np.array(snap_pos),
              **{f'stats_{k}': getattr(slam.stats, k) for k in slam.stats._spec})
     (out / 'metrics.json').write_text(json.dumps(result | {'event_list': slam.events}, indent=1, default=float))
     evaluate.plot(m_online, gt, out / 'trajectory.png', title=f'{name} (live)')
@@ -180,7 +210,8 @@ def summary(run_dirs, metrics=('final', 'rot', 'drift', 'ate', 'lost_episodes', 
       gt = [frame_range(x, r, len(t['final'])) for x in gts[name]]
       R = (t[key][:, :3, :3], gt[1]) if key in t else (None, None)
       lost = lost_flags(len(t['final']), t['stats_frame'], t['stats_lost']) if 'stats_lost' in t else None
-      runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gt[0], est_R=R[0], gt_R=R[1], lost=lost)
+      snaps = (t['snap_frames'], t['snap_idx'], t['snap_pos']) if trajectory == 'online' and 'snap_pos' in t else None
+      runs.setdefault(name, []).append(evaluate.evaluate(t[trajectory], gt[0], est_R=R[0], gt_R=R[1], lost=lost, snapshots=snaps)
                                        | {'fps': r['fps'], 'kfs': r['keyframes']})
     for name, rs in runs.items():   # median over start frames (a failed run counts as infinitely bad)
       if all(r is None for r in rs):
