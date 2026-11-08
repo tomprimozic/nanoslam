@@ -103,7 +103,7 @@ def orb_settings(data, version, K, dist, d):
   cam = 'Camera1' if version == 3 else 'Camera'
   values = {f'{cam}.fx': K[0, 0], f'{cam}.fy': K[1, 1], f'{cam}.cx': K[0, 2], f'{cam}.cy': K[1, 2],
             f'{cam}.k1': 0.0, f'{cam}.k2': 0.0, f'{cam}.p1': 0.0, f'{cam}.p2': 0.0, f'{cam}.k3': 0.0,
-            'Camera.width': data.width, 'Camera.height': data.height, 'Camera.fps': round(fps(data), 3)}
+            'Camera.width': data.width, 'Camera.height': data.height, 'Camera.fps': int(round(fps(data)))}
   lines = []
   for line in (ex / 'TUM1.yaml').read_text().splitlines():
     key = line.split(':')[0].strip()
@@ -131,6 +131,10 @@ def setup_dso(data, start, d):
   w, h = data.width, data.height
   if dist is not None and len(dist) == 4:     # DSO's usual EuRoC setup: RadTan, cropped to 640 x 480
     calib = f'RadTan {K[0, 0]} {K[1, 1]} {K[0, 2]} {K[1, 2]} {" ".join(map(str, dist))}\n{w} {h}\ncrop\n640 480\n'
+  elif w % 16 or h % 16:     # DSO's pyramid needs halvable sizes (KITTI, ETH3D): the same K, right / bottom cropped
+    ow, oh = w // 16 * 16, h // 16 * 16
+    out = f'{K[0, 0] / ow} {K[1, 1] / oh} {(K[0, 2] + 0.5) / ow} {(K[1, 2] + 0.5) / oh} 0'
+    calib = f'Pinhole {K[0, 0]} {K[1, 1]} {K[0, 2]} {K[1, 2]} 0\n{w} {h}\n{out}\n{ow} {oh}\n'
   else:
     calib = f'Pinhole {K[0, 0]} {K[1, 1]} {K[0, 2]} {K[1, 2]} 0\n{w} {h}\nnone\n{w} {h}\n'
   (d / 'camera.txt').write_text(calib)
