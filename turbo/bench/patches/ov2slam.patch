@@ -1,0 +1,923 @@
+diff --git a/build_thirdparty.sh b/build_thirdparty.sh
+index 76446f0..9139bdf 100755
+--- a/build_thirdparty.sh
++++ b/build_thirdparty.sh
+@@ -9,7 +9,7 @@ cd Thirdparty/obindex2
+ mkdir build
+ cd build/
+ cmake .. -DCMAKE_BUILD_TYPE=Release
+-make -j4
++make -j32
+ cd ../../..
+ 
+ echo ""
+@@ -21,7 +21,7 @@ cd Thirdparty/ibow_lcd
+ mkdir build
+ cd build/
+ cmake .. -DCMAKE_BUILD_TYPE=Release
+-make -j4
++make -j32
+ cd ../../..
+ 
+ echo ""
+@@ -34,7 +34,7 @@ mkdir build
+ mkdir install
+ cd build/
+ cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="../install/"
+-make -j4 install
++make -j32 install
+ cd ../../..
+ 
+ echo ""
+@@ -45,6 +45,6 @@ cd Thirdparty/ceres-solver
+ mkdir build
+ mkdir install
+ cd build/
+-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=14 -DCMAKE_CXX_FLAGS="-march=native" -DCMAKE_INSTALL_PREFIX="../install/" -DBUILD_EXAMPLES=OFF
+-make -j4 install
++cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=14 -DCMAKE_CXX_FLAGS="-march=native" -DCMAKE_INSTALL_PREFIX="../install/" -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DSUITESPARSE=OFF -DCXSPARSE=OFF -DEIGENSPARSE=ON -DCMAKE_DISABLE_FIND_PACKAGE_TBB=TRUE
++make -j32 install
+ cd ../../..
+\ No newline at end of file
+diff --git a/include/estimator.hpp b/include/estimator.hpp
+index 631fe83..85e2585 100755
+--- a/include/estimator.hpp
++++ b/include/estimator.hpp
+@@ -27,6 +27,7 @@
+ 
+ 
+ #include <queue>
++#include <atomic>
+ #include <deque>
+ 
+ #include "map_manager.hpp"
+@@ -68,6 +69,8 @@ public:
+ 
+     bool blooseba_on_ = false;
+ 
++    std::atomic<bool> bbusy_{false};
++
+     std::queue<std::shared_ptr<Frame>> qpkfs_;
+ 
+     std::mutex qkf_mutex_;
+diff --git a/include/logger.hpp b/include/logger.hpp
+index 3609f48..591dd7b 100755
+--- a/include/logger.hpp
++++ b/include/logger.hpp
+@@ -291,7 +291,8 @@ public:
+ };
+ 
+ // Has to be defined before being used
+-std::vector<SE3Pose> Logger::vse3pose_, Logger::vfullse3pose_;
+-std::map<double, SE3Pose>  Logger::vse3kfpose_;
+-std::vector<KittiPose> Logger::vkittipose_;
+-std::vector<FramePose> Logger::vframepose_;
+\ No newline at end of file
++inline std::vector<SE3Pose> Logger::vse3pose_;
++inline std::vector<SE3Pose> Logger::vfullse3pose_;
++inline std::map<double, SE3Pose>  Logger::vse3kfpose_;
++inline std::vector<KittiPose> Logger::vkittipose_;
++inline std::vector<FramePose> Logger::vframepose_;
+\ No newline at end of file
+diff --git a/include/mapper.hpp b/include/mapper.hpp
+index b14c01b..00be04f 100755
+--- a/include/mapper.hpp
++++ b/include/mapper.hpp
+@@ -27,6 +27,7 @@
+ 
+ 
+ #include <queue>
++#include <atomic>
+ #include <vector>
+ #include <unordered_set>
+ 
+@@ -128,6 +129,8 @@ public:
+     bool bwaiting_for_lc_ = false;
+     bool bexit_required_ = false; 
+ 
++    std::atomic<bool> bbusy_{false};
++
+     std::queue<Keyframe> qkfs_;
+ 
+     std::mutex qkf_mutex_;
+diff --git a/include/ros_visualizer.hpp b/include/ros_visualizer.hpp
+index 8cbd149..0f3eb49 100755
+--- a/include/ros_visualizer.hpp
++++ b/include/ros_visualizer.hpp
+@@ -25,6 +25,37 @@
+ */
+ #pragma once
+ 
++#ifdef OV2SLAM_NO_ROS
++
++// Standalone build: no-op visualizer with the same interface as below.
++#include <ros/ros.h>
++#include <pcl_ros/point_cloud.h>
++#include <sophus/se3.hpp>
++#include <opencv2/core.hpp>
++#include <fstream>
++#include <iomanip>
++
++struct NoRosPublisher {
++    int getNumSubscribers() const { return 0; }
++};
++
++class RosVisualizer {
++public:
++    void pubTrackImage(const cv::Mat &, const double) {}
++    void pubVO(const Sophus::SE3d &, const double) {}
++    void addVisualKF(const Sophus::SE3d &) {}
++    void pubVisualKFs(const double) {}
++    void pubPointCloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr, const double) {}
++    void addKFsTraj(const Sophus::SE3d &) {}
++    void clearKFsTraj() {}
++    void pubKFsTraj(const double) {}
++    void pubFinalKFsTraj(const Sophus::SE3d &, const double) {}
++
++    NoRosPublisher pub_image_track_, pub_kfs_pose_, pub_kfs_traj_, pub_final_kfs_traj_;
++};
++
++#else
++
+ 
+ #include <ros/ros.h>
+ 
+@@ -309,4 +340,5 @@ public:
+     ros::Publisher pub_kfs_traj_, pub_final_kfs_traj_;
+ 
+     visualization_msgs::Marker kfs_traj_msg_, final_kfs_traj_msg_;
+-};
+\ No newline at end of file
++};
++#endif // OV2SLAM_NO_ROS
+diff --git a/include/slam_params.hpp b/include/slam_params.hpp
+index dbb2252..44cdab4 100755
+--- a/include/slam_params.hpp
++++ b/include/slam_params.hpp
+@@ -160,4 +160,7 @@ public:
+ 
+     // Final BA
+     bool do_full_ba_;
++
++    // Standalone (no ROS) driver: process each KF fully before the next frame
++    bool bsync_ = false;
+ };
+diff --git a/src/estimator.cpp b/src/estimator.cpp
+index f06a8c6..b34b45f 100755
+--- a/src/estimator.cpp
++++ b/src/estimator.cpp
+@@ -46,6 +46,11 @@ void Estimator::run()
+ 
+                 mapFiltering();
+ 
++                std::lock_guard<std::mutex> lock(qkf_mutex_);
++                if( qpkfs_.empty() ) {
++                    bbusy_ = false;
++                }
++
+             } else {
+                 if( pslamstate_->debug_ )
+                     std::cout << "\nNO OPITMIZATION (NEITHER SLAM MODE NOR SW MODE SELECTED) !\n";
+@@ -223,6 +228,7 @@ void Estimator::addNewKf(const std::shared_ptr<Frame> &pkf)
+     std::lock_guard<std::mutex> lock(qkf_mutex_);
+     qpkfs_.push(pkf);
+     bnewkfavailable_ = true;
++    bbusy_ = true;
+ 
+     // We signal that a new KF is ready
+     if( pslamstate_->blocalba_is_on_ 
+diff --git a/src/mapper.cpp b/src/mapper.cpp
+index d942bea..0cf5baf 100755
+--- a/src/mapper.cpp
++++ b/src/mapper.cpp
+@@ -132,6 +132,7 @@ void Mapper::run()
+                     std::cout << "\n Bad initialization detected! Resetting\n";
+                     pslamstate_->breset_req_ = true;
+                     reset();
++                    bbusy_ = false;
+                     continue;
+                 } 
+                 else if( kf.kfid_ < 10 && pnewkf->nb3dkps_ < 3 ) {
+@@ -139,6 +140,7 @@ void Mapper::run()
+                             << pnewkf->nb3dkps_;
+                     pslamstate_->breset_req_ = true;
+                     reset();
++                    bbusy_ = false;
+                     continue;
+                 }
+             }
+@@ -172,6 +174,10 @@ void Mapper::run()
+             if( pslamstate_->debug_ || pslamstate_->log_timings_ )
+         Profiler::StopAndDisplay(pslamstate_->debug_, "0.Keyframe-Processing_Mapper");
+ 
++            std::lock_guard<std::mutex> lock(qkf_mutex_);
++            if( qkfs_.empty() ) {
++                bbusy_ = false;
++            }
+         } else {
+             std::chrono::microseconds dura(100);
+             std::this_thread::sleep_for(dura);
+@@ -543,9 +549,12 @@ bool Mapper::matchingToLocalMap(Frame &frame)
+     }
+ 
+     // Merge in a thread to avoid waiting for BA to finish
+-    // mergeMatches(frame, map_previd_newid);
+-    std::thread thread(&Mapper::mergeMatches, this, std::ref(frame), map_previd_newid);
+-    thread.detach();
++    if( pslamstate_->bsync_ ) {
++        mergeMatches(frame, map_previd_newid);
++    } else {
++        std::thread thread(&Mapper::mergeMatches, this, std::ref(frame), map_previd_newid);
++        thread.detach();
++    }
+ 
+     if( pslamstate_->debug_ || pslamstate_->log_timings_ )
+         Profiler::StopAndDisplay(pslamstate_->debug_, "1.KF_MatchingToLocalMap");
+@@ -816,6 +825,7 @@ void Mapper::addNewKf(const Keyframe &kf)
+     qkfs_.push(kf);
+ 
+     bnewkfavailable_ = true;
++    bbusy_ = true;
+ }
+ 
+ void Mapper::reset()
+diff --git a/src/optimizer.cpp b/src/optimizer.cpp
+index 12f566a..15b7247 100755
+--- a/src/optimizer.cpp
++++ b/src/optimizer.cpp
+@@ -24,6 +24,8 @@
+ *             Martial Sanfourche <first.last at onera dot fr>      (ONERA, DTIS - IVA)
+ */
+ 
++#include <fstream>
++#include <iomanip>
+ #include "optimizer.hpp"
+ 
+ #include "ceres_parametrization.hpp"
+diff --git a/src/ov2slam.cpp b/src/ov2slam.cpp
+index cfe5c34..1334527 100755
+--- a/src/ov2slam.cpp
++++ b/src/ov2slam.cpp
+@@ -488,7 +488,7 @@ void SlamManager::visualizeFrame(const cv::Mat &imleft, const double time)
+ 
+     // Display keypoints
+     cv::Mat img_2_pub;
+-    cv::cvtColor(imleft, img_2_pub, CV_GRAY2RGB);
++    cv::cvtColor(imleft, img_2_pub, cv::COLOR_GRAY2RGB);
+ 
+     for( const auto &kp : pcurframe_->getKeypoints() ) {
+         cv::Scalar col;
+diff --git a/standalone/CMakeLists.txt b/standalone/CMakeLists.txt
+new file mode 100644
+index 0000000..024fa41
+--- /dev/null
++++ b/standalone/CMakeLists.txt
+@@ -0,0 +1,62 @@
++cmake_minimum_required(VERSION 3.10)
++project(ov2slam_standalone)
++
++# ROS-free build of OV²SLAM with a TUM-sequence driver (see tum_main.cpp).
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_BUILD_TYPE Release)
++set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -march=native -Wno-deprecated-declarations")
++
++set(OV2SLAM_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
++
++find_package(OpenCV REQUIRED)
++find_package(Eigen3 3.3 REQUIRED NO_MODULE)
++find_package(Ceres REQUIRED NO_DEFAULT_PATH PATHS ${OV2SLAM_ROOT}/Thirdparty/ceres-solver/install)
++find_package(opengv QUIET PATHS $ENV{HOME}/my/lib/opengv/install NO_DEFAULT_PATH)
++
++add_definitions(-DOPENCV_CONTRIB -DOV2SLAM_NO_ROS)
++if(opengv_FOUND)
++  message(STATUS "OpenGV found: ${opengv_DIR}")
++  add_definitions(-DUSE_OPENGV)
++endif()
++
++add_library(ov2slam STATIC
++  ${OV2SLAM_ROOT}/src/ov2slam.cpp
++  ${OV2SLAM_ROOT}/src/visual_front_end.cpp
++  ${OV2SLAM_ROOT}/src/frame.cpp
++  ${OV2SLAM_ROOT}/src/slam_params.cpp
++  ${OV2SLAM_ROOT}/src/camera_calibration.cpp
++  ${OV2SLAM_ROOT}/src/feature_extractor.cpp
++  ${OV2SLAM_ROOT}/src/feature_tracker.cpp
++  ${OV2SLAM_ROOT}/src/map_manager.cpp
++  ${OV2SLAM_ROOT}/src/map_point.cpp
++  ${OV2SLAM_ROOT}/src/mapper.cpp
++  ${OV2SLAM_ROOT}/src/multi_view_geometry.cpp
++  ${OV2SLAM_ROOT}/src/ceres_parametrization.cpp
++  ${OV2SLAM_ROOT}/src/optimizer.cpp
++  ${OV2SLAM_ROOT}/src/estimator.cpp
++  ${OV2SLAM_ROOT}/src/loop_closer.cpp
++)
++target_include_directories(ov2slam PUBLIC
++  ${CMAKE_CURRENT_SOURCE_DIR}/shim
++  ${OV2SLAM_ROOT}/include
++  ${OV2SLAM_ROOT}/include/ceres_parametrization
++  ${OV2SLAM_ROOT}/Thirdparty/Sophus
++)
++target_link_libraries(ov2slam PUBLIC Eigen3::Eigen ${OpenCV_LIBS} Ceres::ceres)
++if(opengv_FOUND)
++  target_link_libraries(ov2slam PUBLIC opengv)
++endif()
++
++if(EXISTS "${OV2SLAM_ROOT}/Thirdparty/ibow_lcd/build/liblcdetector.so")
++  message(STATUS "iBoW-LCD found: loop closing enabled")
++  target_compile_definitions(ov2slam PUBLIC IBOW_LCD)
++  target_include_directories(ov2slam PUBLIC ${OV2SLAM_ROOT}/Thirdparty/obindex2/lib/include/ ${OV2SLAM_ROOT}/Thirdparty/ibow_lcd/include/)
++  target_link_libraries(ov2slam PUBLIC ${OV2SLAM_ROOT}/Thirdparty/ibow_lcd/build/liblcdetector.so)
++endif()
++
++add_executable(ov2slam_tum tum_main.cpp)
++target_link_libraries(ov2slam_tum PRIVATE ov2slam)
++
++add_executable(ov2slam_bench bench_main.cpp)
++target_link_libraries(ov2slam_bench PRIVATE ov2slam)
+diff --git a/standalone/bench_main.cpp b/standalone/bench_main.cpp
+new file mode 100644
+index 0000000..e83a17a
+--- /dev/null
++++ b/standalone/bench_main.cpp
+@@ -0,0 +1,199 @@
++// Standalone (ROS-free) OV²SLAM driver for benchmarking (monocular).
++//
++//   ov2slam_bench params.yaml frames.txt out_prefix [--async]
++//
++// frames.txt: one "timestamp image_path" per line. Writes
++//   <out_prefix>_live.txt  the pose of every tracked frame as estimated at that frame (TUM format; resets do not
++//                          erase earlier poses: after a reset the poses are in the new map's frame)
++//   <out_prefix>_kfs.txt   the keyframe poses at the end (after loop closures / full BA when enabled)
++//   <out_prefix>_info.txt  key=value: frames, resets, seconds
++// By default every frame waits until the mapper / estimator threads are idle (deterministic, "infinitely fast"
++// back-end); --async runs them concurrently at full speed.
++
++#include <atomic>
++#include <chrono>
++#include <fstream>
++#include <iomanip>
++#include <map>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <opencv2/imgcodecs.hpp>
++
++#include "ov2slam.hpp"
++
++static void waitIdle(SlamManager &slam)
++{
++    auto &mapper = *slam.pmapper_;
++    auto &estimator = *mapper.pestimator_;
++    while( mapper.bbusy_ || estimator.bbusy_ || slam.pslamstate_->blocalba_is_on_ || slam.pslamstate_->blc_is_on_ ) {
++        std::this_thread::sleep_for(std::chrono::microseconds(50));
++    }
++}
++
++static void writeTUM(const std::string &filename, const std::vector<std::pair<double, Sophus::SE3d>> &poses)
++{
++    std::ofstream f(filename);
++    f << std::fixed;
++    for( const auto &tp : poses ) {
++        const Eigen::Vector3d t = tp.second.translation();
++        const Eigen::Quaterniond q = tp.second.unit_quaternion();
++        f << std::setprecision(6) << tp.first << " " << std::setprecision(9)
++          << t.x() << " " << t.y() << " " << t.z() << " "
++          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
++    }
++}
++
++int main(int argc, char **argv)
++{
++    if( argc < 4 ) {
++        std::cerr << "usage: " << argv[0] << " params.yaml frames.txt out_prefix [--async]\n";
++        return 1;
++    }
++    const std::string params_file = argv[1];
++    const std::string frames_file = argv[2];
++    const std::string out_prefix = argv[3];
++    bool sync = true;
++    for( int i = 4 ; i < argc ; i++ ) {
++        if( std::string(argv[i]) == "--async" ) sync = false;
++    }
++
++    cv::FileStorage fs(params_file, cv::FileStorage::READ);
++    if( !fs.isOpened() ) {
++        std::cerr << "cannot open " << params_file << "\n";
++        return 1;
++    }
++    auto pparams = std::make_shared<SlamParams>(fs);
++    pparams->bsync_ = sync;
++    auto pviz = std::make_shared<RosVisualizer>();
++
++    std::vector<std::pair<double, std::string>> images;
++    {
++        std::ifstream f(frames_file);
++        std::string line;
++        while( std::getline(f, line) ) {
++            if( line.empty() || line[0] == '#' ) continue;
++            std::istringstream ss(line);
++            double t; std::string fn;
++            ss >> t >> fn;
++            images.emplace_back(t, fn);
++        }
++    }
++    std::cout << "\n" << images.size() << " images\n";
++
++    SlamManager slam(pparams, pviz);
++
++    std::vector<std::pair<double, Sophus::SE3d>> live;
++    std::ofstream flive(out_prefix + "_live.txt");   // written as we go: a crash keeps the poses so far
++    flive << std::fixed;
++    // belief log: after every frame the keyframes whose pose changed ("S <time>", then "<keyframe time> <T_wc>");
++    // removed keyframes are gone (their last pose stays)
++    std::ofstream fbel(out_prefix + "_beliefs.txt");
++    fbel << std::fixed;
++    std::map<int, Eigen::Matrix4d> last;
++    int nresets = 0;
++
++    auto wall0 = std::chrono::steady_clock::now();
++    for( size_t i = 0 ; i < images.size() ; i++ )
++    {
++        const double time = images[i].first;
++        cv::Mat img;
++        for( int attempt = 0 ; attempt < 5 && img.empty() ; attempt++ ) {   // (transient read errors seen on the server)
++            if( attempt ) std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            img = cv::imread(images[i].second, cv::IMREAD_GRAYSCALE);
++        }
++        if( img.empty() ) {
++            std::cerr << "cannot read " << images[i].second << ", frame skipped\n";
++            continue;
++        }
++        if( slam.pslamstate_->bdo_undist_ ) {
++            slam.pcalib_model_left_->rectifyImage(img, img);
++        }
++
++        slam.frame_id_++;
++        slam.pcurframe_->updateFrame(slam.frame_id_, time);
++
++        bool is_kf_req = slam.pvisualfrontend_->visualTracking(img, time);
++
++        Logger::addSE3Pose(time, slam.pcurframe_->getTwc(), is_kf_req);
++
++        if( slam.pslamstate_->breset_req_ ) {
++            waitIdle(slam);
++            slam.reset();
++            last.clear();     // (keyframe ids start again)
++            nresets++;
++            continue;
++        }
++
++        if( slam.pslamstate_->bvision_init_ ) {
++            live.emplace_back(time, slam.pcurframe_->getTwc());
++            const Sophus::SE3d &T = live.back().second;
++            const Eigen::Vector3d t = T.translation();
++            const Eigen::Quaterniond q = T.unit_quaternion();
++            flive << std::setprecision(6) << time << " " << std::setprecision(9) << t.x() << " " << t.y() << " "
++                  << t.z() << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
++        }
++
++        if( is_kf_req ) {
++            Keyframe kf(slam.pcurframe_->kfid_, img);
++            slam.pmapper_->addNewKf(kf);
++        }
++
++        if( sync ) waitIdle(slam);
++
++        {
++            bool header = false;
++            for( const auto &kfid_pkf : slam.pmap_->map_pkfs_ ) {
++                if( kfid_pkf.second == nullptr ) continue;
++                const Sophus::SE3d T = kfid_pkf.second->getTwc();
++                auto it = last.find(kfid_pkf.first);
++                if( it != last.end() && (T.matrix() - it->second).cwiseAbs().maxCoeff() < 1e-7 ) continue;
++                if( !header ) { fbel << "S " << std::setprecision(6) << time << "\n"; header = true; }
++                const Eigen::Vector3d t = T.translation();
++                const Eigen::Quaterniond q = T.unit_quaternion();
++                fbel << std::setprecision(6) << kfid_pkf.second->img_time_ << " " << std::setprecision(9) << t.x() << " "
++                     << t.y() << " " << t.z() << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
++                last[kfid_pkf.first] = T.matrix();
++            }
++        }
++
++        if( i % 500 == 0 ) {
++            std::cout << "\n[ov2slam_bench] frame " << i << " / kfs " << slam.pmap_->nbkfs_
++                      << " / 3d kps " << slam.pcurframe_->nb3dkps_ << std::flush;
++        }
++    }
++
++    waitIdle(slam);
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    waitIdle(slam);
++
++    if( slam.pslamstate_->do_full_ba_ ) {
++        std::lock_guard<std::mutex> lock(slam.pmap_->map_mutex_);
++        slam.pmapper_->runFullBA();
++    }
++    double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
++
++    flive.close();
++    fbel.close();
++
++    std::vector<std::pair<double, Sophus::SE3d>> kfposes;
++    for( const auto &kfid_pkf : slam.pmap_->map_pkfs_ ) {
++        if( kfid_pkf.second != nullptr )
++            kfposes.emplace_back(kfid_pkf.second->img_time_, kfid_pkf.second->getTwc());
++    }
++    std::sort(kfposes.begin(), kfposes.end(), [](auto &a, auto &b) { return a.first < b.first; });
++    writeTUM(out_prefix + "_kfs.txt", kfposes);
++
++    std::ofstream(out_prefix + "_info.txt") << "frames=" << images.size() << "\nresets=" << nresets
++                                             << "\nseconds=" << wall << "\n";
++    std::cout << "\n\n[ov2slam_bench] done: " << live.size() << " live poses, " << kfposes.size()
++              << " KFs, " << nresets << " resets, " << wall << " s\n";
++
++    slam.pmapper_->bexit_required_ = true;
++    std::this_thread::sleep_for(std::chrono::milliseconds(200));
++    std::cout << std::flush;
++    std::_Exit(0);
++}
+diff --git a/standalone/shim/pcl_ros/point_cloud.h b/standalone/shim/pcl_ros/point_cloud.h
+new file mode 100644
+index 0000000..2f4801e
+--- /dev/null
++++ b/standalone/shim/pcl_ros/point_cloud.h
+@@ -0,0 +1,20 @@
++#pragma once
++// Minimal stand-in for the PCL point cloud used for visualization only.
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++namespace pcl {
++struct PointXYZRGB {
++    float x = 0.f, y = 0.f, z = 0.f;
++    std::uint8_t r = 0, g = 0, b = 0;
++    PointXYZRGB() = default;
++    PointXYZRGB(std::uint8_t r_, std::uint8_t g_, std::uint8_t b_) : r(r_), g(g_), b(b_) {}
++};
++
++template <typename PointT>
++struct PointCloud {
++    using Ptr = std::shared_ptr<PointCloud<PointT>>;
++    std::vector<PointT> points;
++};
++}
+diff --git a/standalone/shim/ros/ros.h b/standalone/shim/ros/ros.h
+new file mode 100644
+index 0000000..212db28
+--- /dev/null
++++ b/standalone/shim/ros/ros.h
+@@ -0,0 +1,15 @@
++#pragma once
++// Minimal stand-in for the few ROS symbols used outside the visualizer.
++#include <chrono>
++
++namespace ros {
++struct Time {
++    double sec;
++    static Time now() {
++        using namespace std::chrono;
++        return Time{duration<double>(steady_clock::now().time_since_epoch()).count()};
++    }
++    double toSec() const { return sec; }
++};
++inline void requestShutdown() {}
++}
+diff --git a/standalone/tum_fr3_mono.yaml b/standalone/tum_fr3_mono.yaml
+new file mode 100644
+index 0000000..3977292
+--- /dev/null
++++ b/standalone/tum_fr3_mono.yaml
+@@ -0,0 +1,153 @@
++%YAML 1.0
++---
++# TUM RGB-D freiburg3 (images are already undistorted), otherwise parameters_files/accurate/euroc/euroc_mono.yaml
++
++#--------------------------------------------------------------------------------------------
++# Camera Parameters. Adjust them!
++#--------------------------------------------------------------------------------------------
++
++Camera.topic_left: /cam0/image_raw
++Camera.topic_right: /cam1/image_raw
++
++Camera.model_left: pinhole
++Camera.model_right: pinhole
++
++Camera.left_nwidth: 640
++Camera.left_nheight: 480
++
++Camera.right_nwidth: 640
++Camera.right_nheight: 480
++
++# Camera calibration and distortion parameters (OpenCV) 
++Camera.fxl: 535.4
++Camera.fyl: 539.2
++Camera.cxl: 320.1
++Camera.cyl: 247.6
++
++Camera.k1l: 0.
++Camera.k2l: 0.
++Camera.p1l: 0.
++Camera.p2l: 0.
++
++Camera.fxr: 457.587
++Camera.fyr: 456.134
++Camera.cxr: 379.999
++Camera.cyr: 255.238
++
++Camera.k1r: -0.28368365
++Camera.k2r: 0.07451284
++Camera.p1r: -0.00010473
++Camera.p2r: -3.555907e-05
++
++# Camera Extrinsic parameters T_b_ci ( v_b = T_b_ci * v_ci )
++body_T_cam0: !!opencv-matrix
++   rows: 4
++   cols: 4
++   dt: d
++   data: [0.0148655429818, -0.999880929698, 0.00414029679422, -0.0216401454975,
++           0.999557249008, 0.0149672133247, 0.025715529948,  -0.064676986768,
++           -0.0257744366974, 0.00375618835797, 0.999660727178, 0.00981073058949,
++           0., 0., 0., 1.]
++
++body_T_cam1: !!opencv-matrix
++   rows: 4
++   cols: 4
++   dt: d
++   data: [0.0125552670891, -0.999755099723, 0.0182237714554, -0.0198435579556,
++           0.999598781151, 0.0130119051815, 0.0251588363115, 0.0453689425024,
++          -0.0253898008918, 0.0179005838253, 0.999517347078, 0.00786212447038,
++          0., 0., 0., 1.]
++
++#--------------------------------------------------------------------------------------------
++# SLAM Parameters. Adjust them!
++#--------------------------------------------------------------------------------------------
++debug: 0
++log_timings: 0
++
++mono: 1
++stereo: 0
++
++force_realtime: 0
++
++# Estimator Mode
++slam_mode: 1
++
++# Loop Closing mode
++buse_loop_closer: 0
++
++# Stereo rectify or not
++bdo_stereo_rect: 0
++alpha: 0.
++
++# Undist Image or not
++bdo_undist: 0
++
++# Init / KF px th.
++finit_parallax: 20.
++
++# Features Extractor
++use_shi_tomasi: 0
++use_fast: 0
++use_brief: 1
++use_singlescale_detector: 1
++
++# Min dist between kps (define the number of kps)
++nmaxdist: 35
++
++# Features quality th.
++nfast_th: 10
++dmaxquality: 0.001 # used for gftt or singlescale
++
++# Pre-processing
++use_clahe: 1
++fclahe_val: 3
++
++# KLT related settings.
++do_klt: 1
++klt_use_prior: 1
++btrack_keyframetoframe: 0
++nklt_win_size: 9
++nklt_pyr_lvl: 3
++
++# Opencv Default: 30 iters. + 0.01 prec.
++nmax_iter: 30
++fmax_px_precision: 0.01
++
++fmax_fbklt_dist: 0.5
++nklt_err: 30.
++
++# Matching th.
++bdo_track_localmap: 1
++
++fmax_desc_dist: 0.2 #0.35 # Ratio from desc size (for binary desc.) 
++fmax_proj_pxdist: 2.
++
++# Randomize RANSAC?
++doepipolar: 1
++dop3p : 0
++bdo_random: 1
++nransac_iter: 100
++fransac_err: 3.
++
++# Reproj err th.
++fmax_reproj_err: 3.
++buse_inv_depth: 1
++
++# Ceres related parameters
++robust_mono_th: 5.9915 # (20% : 3.2189 / 10% :  4.6052 / 5% : 5.9915 / 2%: 7.8240 / 1%: 9.2103)  
++
++use_sparse_schur: 1
++use_dogleg: 0
++use_subspace_dogleg: 0
++use_nonmonotic_step: 0
++
++# Estimator parameters
++apply_l2_after_robust: 1
++
++nmin_covscore: 25 # Min co-obs for optimizing in SLAM mode BA
++
++# Map Filtering
++fkf_filtering_ratio: 0.95
++
++# Final Pass
++do_full_ba: 0
+\ No newline at end of file
+diff --git a/standalone/tum_main.cpp b/standalone/tum_main.cpp
+new file mode 100644
+index 0000000..3607da2
+--- /dev/null
++++ b/standalone/tum_main.cpp
+@@ -0,0 +1,168 @@
++// Standalone (ROS-free) OV²SLAM driver for TUM-format RGB sequences.
++//
++//   ov2slam_tum params.yaml /path/to/rgbd_dataset_xxx out_prefix [--async] [--max-frames N]
++//
++// By default every frame waits until the mapper / estimator threads have finished processing
++// the previous keyframe (deterministic scheduling, "infinitely fast" back-end).  --async instead
++// replays the images at their recorded rate, as the ROS node would do.
++
++#include <atomic>
++#include <chrono>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <opencv2/imgcodecs.hpp>
++
++#include "ov2slam.hpp"
++
++static void waitIdle(SlamManager &slam)
++{
++    auto &mapper = *slam.pmapper_;
++    auto &estimator = *mapper.pestimator_;
++    while( mapper.bbusy_ || estimator.bbusy_ || slam.pslamstate_->blocalba_is_on_ ) {
++        std::this_thread::sleep_for(std::chrono::microseconds(50));
++    }
++}
++
++static void writeTUM(const std::string &filename, const std::vector<std::pair<double, Sophus::SE3d>> &poses)
++{
++    std::ofstream f(filename);
++    f << std::fixed;
++    for( const auto &tp : poses ) {
++        const Eigen::Vector3d t = tp.second.translation();
++        const Eigen::Quaterniond q = tp.second.unit_quaternion();
++        f << std::setprecision(6) << tp.first << " " << std::setprecision(9)
++          << t.x() << " " << t.y() << " " << t.z() << " "
++          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
++    }
++}
++
++int main(int argc, char **argv)
++{
++    if( argc < 4 ) {
++        std::cerr << "usage: " << argv[0] << " params.yaml dataset_dir out_prefix [--async] [--max-frames N]\n";
++        return 1;
++    }
++    const std::string params_file = argv[1];
++    const std::string dataset_dir = argv[2];
++    const std::string out_prefix = argv[3];
++    bool sync = true;
++    long max_frames = -1;
++    for( int i = 4 ; i < argc ; i++ ) {
++        std::string a = argv[i];
++        if( a == "--async" ) sync = false;
++        else if( a == "--max-frames" && i + 1 < argc ) max_frames = std::stol(argv[++i]);
++    }
++
++    cv::FileStorage fs(params_file, cv::FileStorage::READ);
++    if( !fs.isOpened() ) {
++        std::cerr << "cannot open " << params_file << "\n";
++        return 1;
++    }
++    auto pparams = std::make_shared<SlamParams>(fs);
++    pparams->bsync_ = sync;
++    auto pviz = std::make_shared<RosVisualizer>();
++
++    // Read the image list
++    std::vector<std::pair<double, std::string>> images;
++    {
++        std::ifstream f(dataset_dir + "/rgb.txt");
++        std::string line;
++        while( std::getline(f, line) ) {
++            if( line.empty() || line[0] == '#' ) continue;
++            std::istringstream ss(line);
++            double t; std::string fn;
++            ss >> t >> fn;
++            images.emplace_back(t, fn);
++        }
++    }
++    std::cout << "\n" << images.size() << " images\n";
++
++    SlamManager slam(pparams, pviz);
++
++    // All poses emitted online (one per processed frame), and the reset count
++    std::vector<std::pair<double, Sophus::SE3d>> online;
++    int nresets = 0;
++
++    auto wall0 = std::chrono::steady_clock::now();
++    for( size_t i = 0 ; i < images.size() ; i++ )
++    {
++        if( max_frames >= 0 && (long)i >= max_frames ) break;
++        const double time = images[i].first;
++
++        if( !sync ) {
++            // Replay at recorded rate
++            double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
++            double target = time - images[0].first;
++            if( target > elapsed )
++                std::this_thread::sleep_for(std::chrono::duration<double>(target - elapsed));
++        }
++
++        cv::Mat img = cv::imread(dataset_dir + "/" + images[i].second, cv::IMREAD_GRAYSCALE);
++        if( img.empty() ) {
++            std::cerr << "cannot read " << images[i].second << "\n";
++            continue;
++        }
++
++        if( slam.pslamstate_->bdo_undist_ ) {
++            slam.pcalib_model_left_->rectifyImage(img, img);
++        }
++
++        slam.frame_id_++;
++        slam.pcurframe_->updateFrame(slam.frame_id_, time);
++
++        bool is_kf_req = slam.pvisualfrontend_->visualTracking(img, time);
++
++        Logger::addSE3Pose(time, slam.pcurframe_->getTwc(), is_kf_req);
++
++        if( slam.pslamstate_->breset_req_ ) {
++            if( sync ) waitIdle(slam);
++            slam.reset();
++            online.clear();
++            nresets++;
++            continue;
++        }
++
++        if( slam.pslamstate_->bvision_init_ ) {
++            online.emplace_back(time, slam.pcurframe_->getTwc());
++        }
++
++        if( is_kf_req ) {
++            Keyframe kf(slam.pcurframe_->kfid_, img);
++            slam.pmapper_->addNewKf(kf);
++        }
++
++        if( sync ) waitIdle(slam);
++
++        if( i % 100 == 0 ) {
++            std::cout << "\n[ov2slam_tum] frame " << i << " / kfs " << slam.pmap_->nbkfs_
++                      << " / 3d kps " << slam.pcurframe_->nb3dkps_ << std::flush;
++        }
++    }
++
++    waitIdle(slam);
++    double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
++
++    writeTUM(out_prefix + "_online.txt", online);
++
++    std::vector<std::pair<double, Sophus::SE3d>> kfposes;
++    for( const auto &kfid_pkf : slam.pmap_->map_pkfs_ ) {
++        if( kfid_pkf.second != nullptr )
++            kfposes.emplace_back(kfid_pkf.second->img_time_, kfid_pkf.second->getTwc());
++    }
++    std::sort(kfposes.begin(), kfposes.end(), [](auto &a, auto &b) { return a.first < b.first; });
++    writeTUM(out_prefix + "_kfs.txt", kfposes);
++
++    std::cout << "\n\n[ov2slam_tum] done: " << online.size() << " online poses, " << kfposes.size()
++              << " KFs, " << nresets << " resets, " << wall << " s\n";
++
++    slam.pmapper_->bexit_required_ = true;
++    std::this_thread::sleep_for(std::chrono::milliseconds(200));
++    std::cout << std::flush;
++    std::_Exit(0);
++}

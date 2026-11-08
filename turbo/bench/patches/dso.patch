@@ -1,0 +1,247 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0f137ec..41b6335 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,8 +25,8 @@ find_package(OpenCV QUIET)
+ # flags
+ add_definitions("-DENABLE_SSE")
+ set(CMAKE_CXX_FLAGS
+-   "${SSE_FLAGS} -O3 -g -std=c++0x -march=native"
+-#   "${SSE_FLAGS} -O3 -g -std=c++0x -fno-omit-frame-pointer"
++   "${SSE_FLAGS} -O3 -g -std=c++14 -march=native"
++#   "${SSE_FLAGS} -O3 -g -std=c++14 -fno-omit-frame-pointer"
+ )
+ 
+ if (MSVC)
+@@ -126,6 +126,8 @@ if (OpenCV_FOUND AND Pangolin_FOUND)
+ 	message("--- compiling dso_dataset.")
+ 	add_executable(dso_dataset ${PROJECT_SOURCE_DIR}/src/main_dso_pangolin.cpp )
+     target_link_libraries(dso_dataset dso boost_system cxsparse ${BOOST_THREAD_LIBRARY} ${LIBZIP_LIBRARY} ${Pangolin_LIBRARIES} ${OpenCV_LIBS})
++    add_executable(dso_bench ${PROJECT_SOURCE_DIR}/src/main_bench.cpp )
++    target_link_libraries(dso_bench dso boost_system cxsparse ${BOOST_THREAD_LIBRARY} ${LIBZIP_LIBRARY} ${Pangolin_LIBRARIES} ${OpenCV_LIBS})
+ else()
+ 	message("--- not building dso_dataset, since either don't have openCV or Pangolin.")
+ endif()
+diff --git a/src/IOWrapper/OpenCV/ImageRW_OpenCV.cpp b/src/IOWrapper/OpenCV/ImageRW_OpenCV.cpp
+index 170cb33..685eb72 100644
+--- a/src/IOWrapper/OpenCV/ImageRW_OpenCV.cpp
++++ b/src/IOWrapper/OpenCV/ImageRW_OpenCV.cpp
+@@ -34,7 +34,7 @@ namespace IOWrap
+ {
+ MinimalImageB* readImageBW_8U(std::string filename)
+ {
+-	cv::Mat m = cv::imread(filename, CV_LOAD_IMAGE_GRAYSCALE);
++	cv::Mat m = cv::imread(filename, cv::IMREAD_GRAYSCALE);
+ 	if(m.rows*m.cols==0)
+ 	{
+ 		printf("cv::imread could not read image %s! this may segfault. \n", filename.c_str());
+@@ -52,7 +52,7 @@ MinimalImageB* readImageBW_8U(std::string filename)
+ 
+ MinimalImageB3* readImageRGB_8U(std::string filename)
+ {
+-	cv::Mat m = cv::imread(filename, CV_LOAD_IMAGE_COLOR);
++	cv::Mat m = cv::imread(filename, cv::IMREAD_COLOR);
+ 	if(m.rows*m.cols==0)
+ 	{
+ 		printf("cv::imread could not read image %s! this may segfault. \n", filename.c_str());
+@@ -70,7 +70,7 @@ MinimalImageB3* readImageRGB_8U(std::string filename)
+ 
+ MinimalImage<unsigned short>* readImageBW_16U(std::string filename)
+ {
+-	cv::Mat m = cv::imread(filename, CV_LOAD_IMAGE_UNCHANGED);
++	cv::Mat m = cv::imread(filename, cv::IMREAD_UNCHANGED);
+ 	if(m.rows*m.cols==0)
+ 	{
+ 		printf("cv::imread could not read image %s! this may segfault. \n", filename.c_str());
+@@ -88,7 +88,7 @@ MinimalImage<unsigned short>* readImageBW_16U(std::string filename)
+ 
+ MinimalImageB* readStreamBW_8U(char* data, int numBytes)
+ {
+-	cv::Mat m = cv::imdecode(cv::Mat(numBytes,1,CV_8U, data), CV_LOAD_IMAGE_GRAYSCALE);
++	cv::Mat m = cv::imdecode(cv::Mat(numBytes,1,CV_8U, data), cv::IMREAD_GRAYSCALE);
+ 	if(m.rows*m.cols==0)
+ 	{
+ 		printf("cv::imdecode could not read stream (%d bytes)! this may segfault. \n", numBytes);
+diff --git a/src/main_bench.cpp b/src/main_bench.cpp
+new file mode 100644
+index 0000000..8482f93
+--- /dev/null
++++ b/src/main_bench.cpp
+@@ -0,0 +1,164 @@
++// Monocular benchmark driver (shared by the slambench comparison), without GUI.
++//
++//   dso_bench calib.txt frames.txt out_prefix
++//
++// frames.txt: "timestamp image_path" per line. No photometric calibration (mode=1), preset 0 (default settings, not
++// enforcing real time: mapping runs synchronously, as in DSO's own non-realtime runs). Like the original driver,
++// resets while initializing (first 250 frames) and stops when lost. Writes
++//   <out_prefix>_live.txt  pose of every tracked frame as estimated at that frame (TUM format, T_wc)
++//   <out_prefix>_kfs.txt   keyframe poses at the end (TUM format, T_wc)
++//   <out_prefix>_info.txt  key=value: frames, seconds, lost (frame index or -1), resets
++#include <chrono>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <set>
++#include <map>
++#include <unistd.h>
++#include <sstream>
++
++#include "IOWrapper/Output3DWrapper.h"
++#include "IOWrapper/ImageRW.h"
++#include "util/settings.h"
++#include "util/globalFuncs.h"
++#include "util/globalCalib.h"
++#include "util/Undistort.h"
++#include "util/NumType.h"
++#include "util/FrameShell.h"
++#include "FullSystem/FullSystem.h"
++#include "FullSystem/HessianBlocks.h"
++
++using namespace dso;
++
++static void writePose(std::ofstream &f, double t, const SE3 &Twc)
++{
++    Eigen::Quaterniond q = Twc.so3().unit_quaternion();
++    Vec3 p = Twc.translation();
++    f << std::fixed << std::setprecision(6) << t << std::setprecision(9) << " " << p.x() << " " << p.y() << " " << p.z()
++      << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
++}
++
++struct Recorder : public IOWrap::Output3DWrapper
++{
++    std::ofstream live;
++    std::set<FrameShell*> kfs;
++    void publishCamPose(FrameShell* frame, CalibHessian* HCalib) override
++    {
++        if( frame->poseValid )
++            writePose(live, frame->timestamp, frame->camToWorld);
++    }
++    void publishKeyframes(std::vector<FrameHessian*> &frames, bool final, CalibHessian* HCalib) override
++    {
++        for( FrameHessian* fh : frames ) kfs.insert(fh->shell);
++    }
++    void reset() override { kfs.clear(); }
++};
++
++int main(int argc, char** argv)
++{
++    if( argc != 4 ) {
++        std::cerr << "usage: dso_bench calib.txt frames.txt out_prefix\n";
++        return 1;
++    }
++    // mode=1 (no photometric calibration), preset=0, quiet
++    setting_photometricCalibration = 0;
++    setting_affineOptModeA = 0;
++    setting_affineOptModeB = 0;
++    setting_desiredImmatureDensity = 1500;
++    setting_desiredPointDensity = 2000;
++    setting_minFrames = 5;
++    setting_maxFrames = 7;
++    setting_maxOptIterations = 6;
++    setting_minOptIterations = 1;
++    setting_logStuff = false;
++    setting_debugout_runquiet = true;
++    disableAllDisplay = true;
++
++    std::vector<double> times;
++    std::vector<std::string> files;
++    {
++        std::ifstream f(argv[2]);
++        std::string line;
++        while( std::getline(f, line) ) {
++            if( line.empty() || line[0] == '#' ) continue;
++            std::istringstream ss(line);
++            double t; std::string fn;
++            ss >> t >> fn;
++            times.push_back(t);
++            files.push_back(fn);
++        }
++    }
++    const std::string out = argv[3];
++
++    Undistort* undistort = Undistort::getUndistorterForFile(argv[1], "", "");
++    Eigen::Matrix3f K = undistort->getK().cast<float>();
++    setGlobalCalib(undistort->getSize()[0], undistort->getSize()[1], K);
++
++    Recorder* rec = new Recorder();
++    rec->live.open(out + "_live.txt");
++    FullSystem* fullSystem = new FullSystem();
++    fullSystem->setGammaFunction(0);
++    fullSystem->linearizeOperation = true;
++    fullSystem->outputWrapper.push_back(rec);
++
++    int lost = -1, resets = 0;
++    // belief log: after every frame the keyframes whose pose changed ("S <time>", then "<keyframe time> <T_wc>")
++    std::ofstream fbel(out + "_beliefs.txt");
++    std::map<FrameShell*, SE3, std::less<FrameShell*>, Eigen::aligned_allocator<std::pair<FrameShell* const, SE3>>> last;
++    auto wall0 = std::chrono::steady_clock::now();
++    for( size_t i = 0 ; i < files.size() ; i++ ) {
++        MinimalImageB* minimg = 0;
++        for( int attempt = 0 ; attempt < 5 && minimg == 0 ; attempt++ ) {   // (transient read errors seen on the server)
++            if( attempt ) usleep(100000);
++            minimg = IOWrap::readImageBW_8U(files[i]);
++        }
++        if( minimg == 0 ) {
++            std::cerr << "cannot read " << files[i] << ", frame skipped\n";
++            continue;
++        }
++        ImageAndExposure* img = undistort->undistort<unsigned char>(minimg, 1.0f, times[i]);
++        delete minimg;
++        fullSystem->addActiveFrame(img, i);
++        delete img;
++        if( fullSystem->initFailed || setting_fullResetRequested ) {
++            if( i < 250 || setting_fullResetRequested ) {
++                std::vector<IOWrap::Output3DWrapper*> wraps = fullSystem->outputWrapper;
++                delete fullSystem;
++                for( IOWrap::Output3DWrapper* ow : wraps ) ow->reset();
++                last.clear();     // (the shells of the old system are gone)
++                fullSystem = new FullSystem();
++                fullSystem->setGammaFunction(0);
++                fullSystem->linearizeOperation = true;
++                fullSystem->outputWrapper = wraps;
++                setting_fullResetRequested = false;
++                resets++;
++            }
++        }
++        {
++            bool header = false;
++            for( FrameShell* sh : rec->kfs ) {
++                auto it = last.find(sh);
++                if( it != last.end() && (sh->camToWorld.matrix() - it->second.matrix()).cwiseAbs().maxCoeff() < 1e-7 ) continue;
++                if( !header ) { fbel << "S " << std::fixed << std::setprecision(6) << times[i] << "\n"; header = true; }
++                writePose(fbel, sh->timestamp, sh->camToWorld);
++                last[sh] = sh->camToWorld;
++            }
++        }
++        if( fullSystem->isLost ) {
++            lost = i;
++            break;
++        }
++    }
++    fullSystem->blockUntilMappingIsFinished();
++    double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
++    rec->live.close();
++    fbel.close();
++
++    std::ofstream fkf(out + "_kfs.txt");
++    for( FrameShell* s : rec->kfs )
++        writePose(fkf, s->timestamp, s->camToWorld);
++    fkf.close();
++    std::ofstream(out + "_info.txt") << "frames=" << files.size() << "\nseconds=" << wall << "\nlost=" << lost
++                                     << "\nresets=" << resets << "\n";
++    std::_Exit(0);
++}
+diff --git a/src/util/IndexThreadReduce.h b/src/util/IndexThreadReduce.h
+index 683a8d7..205cc54 100644
+--- a/src/util/IndexThreadReduce.h
++++ b/src/util/IndexThreadReduce.h
+@@ -26,6 +26,8 @@
+ #pragma once
+ #include "util/settings.h"
+ #include "boost/thread.hpp"
++#include <boost/bind/bind.hpp>
++using namespace boost::placeholders;   // (boost >= 1.73: the placeholders are no longer global)
+ #include <stdio.h>
+ #include <iostream>
+ 

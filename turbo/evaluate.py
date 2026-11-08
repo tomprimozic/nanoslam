@@ -9,10 +9,11 @@ live ones (as estimated at that frame), not corrected with hindsight by later lo
 
 Rolling re-alignment: the system keeps revising its estimate of the initial section (local / global BA, loops). A live
 pose at frame t is expressed in the map as it was at t, so it is aligned with the system's estimate of the initial
-section at t (runs save snapshots of it, see run.py), not with the live poses of the section frozen when they were
+section at t (runs log every revision of every past frame, see run.py's BeliefLog), not with the live poses of the
+section frozen when they were
 made: those would count the later refinement of the start of the map as error at the end (~30% of `final` for turbo).
-Each frame of the section has a latest known position: first its live pose, then the system's estimates in the
-snapshots (without snapshots, or if the system dropped that part of the map, it stays the last one it had). Frames up
+Each frame of the section has a latest known position: first its live pose, then the system's revisions of it
+(without any, or if the system dropped that part of the map, it stays the last one it had). Frames up
 to the end of the section use the positions known then.
 
   final     RMSE over the last 10% of frames, initial-section alignment (the headline number)
@@ -74,34 +75,50 @@ def lost_stats(est, lost=None):
   return {'lost_episodes': int(np.sum(ok[:-1] & ~ok[1:])), 'lost%': float(100 * (~ok).mean())}
 
 
-def rolling_errors(est, gt, init, snapshots):
+def saved_updates(t):
+  '''the belief updates of a saved run (trajectory.npz): (time, frame, position); older runs saved snapshots of the
+  start every 20 frames (snap_*): converted, with the frames they covered'''
+  if 'upd_t' in t:
+    return t['upd_t'], t['upd_i'], t['upd_pose'][:, :3]
+  if 'snap_pos' in t:
+    frames, idx, pos = t['snap_frames'], t['snap_idx'], t['snap_pos']
+    ok = np.isfinite(pos).all(axis=2)
+    k, j = np.nonzero(ok)
+    return frames[k], idx[j], pos[k, j], idx
+  return None
+
+
+def rolling_errors(est, gt, init, updates):
   '''
   per-frame error with the initial-section alignment from the latest known positions of the section's frames at the
-  time of each frame: a frame's first known position is its live pose, every snapshot (the system's estimate of the
-  start of the trajectory at that time) updates it. snapshots = (frames, idx, positions): at frame frames[k] the
-  estimate of the frames idx (every few frames of the start) was positions[k]; the alignment uses the frames of the
-  section among idx. Frames up to the end of the section use the positions known then. None: fewer than 3 frames
+  time of each frame: a frame's first known position is its live pose, every update (time, frame, position: the
+  system's revised estimate of that frame, logged after frame `time`) replaces it. Frames up to the end of the section
+  use the positions known then. (A 4th element: the only frames that can be updated, e.g. old snapshots.) None: fewer
+  than 3 frames
   '''
-  frames, idx, positions = snapshots
-  use = init[np.isin(init, idx) & np.isfinite(est[init]).all(axis=1) & np.isfinite(gt[init]).all(axis=1)]
+  t_upd, i_upd, p_upd = updates[:3]
+  use = init[np.isfinite(est[init]).all(axis=1) & np.isfinite(gt[init]).all(axis=1)]
+  if len(updates) > 3:
+    use = use[np.isin(use, updates[3])]
   if len(use) < 3:
     return None
-  col = np.searchsorted(idx, use)
+  col = np.full(max(len(gt), int(i_upd.max()) + 1 if len(i_upd) else 0), -1)
+  col[use] = np.arange(len(use))
+  keep = (i_upd < len(col)) & (col[np.minimum(i_upd, len(col) - 1)] >= 0)
+  t_upd, c_upd, p_upd = t_upd[keep], col[i_upd[keep]], np.asarray(p_upd[keep], np.float64)
+  order = np.argsort(t_upd, kind='stable')
+  t_upd, c_upd, p_upd = t_upd[order], c_upd[order], p_upd[order]
   latest = est[use].copy()
-
-  def update(k):
-    P = positions[k][col]
-    ok = np.isfinite(P).all(axis=1)
-    latest[ok] = P[ok]
-
+  times, first = np.unique(t_upd, return_index=True)
+  bounds = np.r_[first, len(t_upd)]
   k = 0
-  while k < len(frames) and frames[k] <= init[-1]:
-    update(k)
+  while k < len(times) and times[k] <= init[-1]:
+    latest[c_upd[bounds[k]:bounds[k + 1]]] = p_upd[bounds[k]:bounds[k + 1]]
     k += 1
   segments = [(0, align(latest, gt[use])[0])]       # (first frame, alignment)
-  for k in range(k, len(frames)):
-    update(k)
-    segments.append((frames[k], align(latest, gt[use])[0]))
+  for k in range(k, len(times)):
+    latest[c_upd[bounds[k]:bounds[k + 1]]] = p_upd[bounds[k]:bounds[k + 1]]
+    segments.append((int(times[k]), align(latest, gt[use])[0]))
   err = np.full(len(gt), np.nan)
   ok = np.isfinite(est).all(axis=1) & np.isfinite(gt).all(axis=1)
   for (a, to_gt), (b, _) in zip(segments, segments[1:] + [(len(gt), None)]):
@@ -110,11 +127,12 @@ def rolling_errors(est, gt, init, snapshots):
   return err
 
 
-def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align_est=None, lost=None, snapshots=None):
+def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align_est=None, lost=None, updates=None):
   '''
   est, gt: (N, 3) camera centres (rows NaN where not tracked / no ground truth). Lost frames are scored with the last
   estimate (as a system that keeps reporting its last pose would be), so losing track is not better than tracking badly.
-  snapshots: the system's estimates of the start of the trajectory over time (live poses: rolling re-alignment)
+  updates: the system's revised estimates of past frames over time (live poses: rolling re-alignment), see
+  rolling_errors
   '''
   has_gt = np.isfinite(gt).all(axis=1)
   tracked = np.isfinite(est).all(axis=1) & has_gt
@@ -158,7 +176,7 @@ def evaluate(est, gt, coverage=0.2, final_frac=0.1, est_R=None, gt_R=None, align
     scale = s_final / s_init
   drift = float(np.sqrt(np.nanmean(err[idx] ** 2)))
   final_err = float(np.sqrt(np.mean(err[final] ** 2))) if len(final) else np.inf
-  roll = rolling_errors(est, gt, init, snapshots) if snapshots is not None else None
+  roll = rolling_errors(est, gt, init, updates) if updates is not None else None
   if roll is not None:
     err[idx] = roll[idx]
     drift = float(np.sqrt(np.nanmean(err[idx] ** 2)))

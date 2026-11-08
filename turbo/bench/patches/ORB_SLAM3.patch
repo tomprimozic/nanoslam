@@ -1,0 +1,222 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 016e743..dbffafd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,23 +14,23 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+ 
+ # Check C++11 or C++0x support
+ include(CheckCXXCompilerFlag)
+-CHECK_CXX_COMPILER_FLAG("-std=c++11" COMPILER_SUPPORTS_CXX11)
+-CHECK_CXX_COMPILER_FLAG("-std=c++0x" COMPILER_SUPPORTS_CXX0X)
++CHECK_CXX_COMPILER_FLAG("-std=c++14" COMPILER_SUPPORTS_CXX11)
++CHECK_CXX_COMPILER_FLAG("-std=c++14" COMPILER_SUPPORTS_CXX0X)
+ if(COMPILER_SUPPORTS_CXX11)
+-   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
++   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
+    add_definitions(-DCOMPILEDWITHC11)
+-   message(STATUS "Using flag -std=c++11.")
++   message(STATUS "Using flag -std=c++14.")
+ elseif(COMPILER_SUPPORTS_CXX0X)
+-   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
++   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14")
+    add_definitions(-DCOMPILEDWITHC0X)
+-   message(STATUS "Using flag -std=c++0x.")
++   message(STATUS "Using flag -std=c++14.")
+ else()
+    message(FATAL_ERROR "The compiler ${CMAKE_CXX_COMPILER} has no C++11 support. Please use a different C++ compiler.")
+ endif()
+ 
+ LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
+ 
+-find_package(OpenCV 4.4)
++find_package(OpenCV 4.2)
+    if(NOT OpenCV_FOUND)
+       message(FATAL_ERROR "OpenCV > 4.4 not found.")
+    endif()
+@@ -193,6 +193,10 @@ add_executable(mono_tum
+         Examples/Monocular/mono_tum.cc)
+ target_link_libraries(mono_tum ${PROJECT_NAME})
+ 
++add_executable(mono_bench
++        Examples/Monocular/mono_bench.cc)
++target_link_libraries(mono_bench ${PROJECT_NAME})
++
+ add_executable(mono_kitti
+         Examples/Monocular/mono_kitti.cc)
+ target_link_libraries(mono_kitti ${PROJECT_NAME})
+diff --git a/Examples/Monocular/mono_bench.cc b/Examples/Monocular/mono_bench.cc
+new file mode 100644
+index 0000000..48bd793
+--- /dev/null
++++ b/Examples/Monocular/mono_bench.cc
+@@ -0,0 +1,121 @@
++// Monocular benchmark driver (shared by the slambench comparison).
++//
++//   mono_bench vocabulary settings.yaml frames.txt out_prefix
++//
++// frames.txt: "timestamp image_path" per line. Frames are fed at their recorded rate (as in the ORB-SLAM examples: the
++// tracker waits for the next frame's time). Writes
++//   <out_prefix>_live.txt  pose of every frame as estimated at that frame (TUM format, T_wc; states OK and
++//                          RECENTLY_LOST - the pose the system reports; 9th column: id of the map it is in, 10th:
++//                          tracking state, 2 = OK, 3 = RECENTLY_LOST: a motion-model prediction)
++//   <out_prefix>_kfs.txt   keyframe poses at the end, all maps (TUM format, T_wc; 9th column: map id)
++//   <out_prefix>_beliefs.txt keyframe poses whenever they change (see below)
++//   <out_prefix>_info.txt  key=value: frames, seconds, maps
++#include <chrono>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <sstream>
++#include <set>
++#include <map>
++#include <cstdlib>
++#include <thread>
++#include <opencv2/core/core.hpp>
++#include <opencv2/imgcodecs.hpp>
++#include <System.h>
++
++static void writePose(std::ofstream &f, double t, const Sophus::SE3f &Twc, long extra = -1, long extra2 = -1)
++{
++    Eigen::Vector3f p = Twc.translation();
++    Eigen::Quaternionf q = Twc.unit_quaternion();
++    f << std::fixed << std::setprecision(6) << t << std::setprecision(9) << " " << p.x() << " " << p.y() << " " << p.z()
++      << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w();
++    if( extra >= 0 ) f << " " << extra;
++    if( extra2 >= 0 ) f << " " << extra2;
++    f << "\n";
++}
++
++int main(int argc, char **argv)
++{
++    if( argc != 5 ) {
++        std::cerr << "usage: mono_bench vocabulary settings frames.txt out_prefix\n";
++        return 1;
++    }
++    std::vector<double> times;
++    std::vector<std::string> files;
++    {
++        std::ifstream f(argv[3]);
++        std::string line;
++        while( std::getline(f, line) ) {
++            if( line.empty() || line[0] == '#' ) continue;
++            std::istringstream ss(line);
++            double t; std::string fn;
++            ss >> t >> fn;
++            times.push_back(t);
++            files.push_back(fn);
++        }
++    }
++    const std::string out = argv[4];
++    ORB_SLAM3::System SLAM(argv[1], argv[2], ORB_SLAM3::System::MONOCULAR, false);
++    const float scale = SLAM.GetImageScale();
++    std::ofstream flive(out + "_live.txt");
++    // belief log: after every frame the keyframes whose pose changed ("S <time>", then "<keyframe time> <T_wc>"
++    // lines); culled keyframes follow their parent with their pose relative to it (as ORB-SLAM's SaveTrajectory*)
++    std::ofstream fbel(out + "_beliefs.txt");
++    std::set<ORB_SLAM3::KeyFrame*> seen;
++    std::map<ORB_SLAM3::KeyFrame*, Sophus::SE3f> last;
++
++    auto wall0 = std::chrono::steady_clock::now();
++    for( size_t i = 0 ; i < files.size() ; i++ ) {
++        cv::Mat im;
++        for( int attempt = 0 ; attempt < 5 && im.empty() ; attempt++ ) {   // (transient read errors seen on the server)
++            if( attempt ) std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            im = cv::imread(files[i], cv::IMREAD_UNCHANGED);
++        }
++        if( im.empty() ) {
++            std::cerr << "cannot read " << files[i] << ", frame skipped\n";
++            continue;
++        }
++        if( scale != 1.f )
++            cv::resize(im, im, cv::Size(im.cols * scale, im.rows * scale));
++        auto t1 = std::chrono::steady_clock::now();
++        Sophus::SE3f Tcw = SLAM.TrackMonocular(im, times[i]);
++        int state = SLAM.GetTrackingState();
++        if( state == ORB_SLAM3::Tracking::OK || state == ORB_SLAM3::Tracking::RECENTLY_LOST )
++            writePose(flive, times[i], Tcw.inverse(), SLAM.GetAtlas()->GetCurrentMap()->GetId(), state);
++        for( auto *pMap : SLAM.GetAtlas()->GetAllMaps() )
++            for( auto *pKF : pMap->GetAllKeyFrames() ) seen.insert(pKF);
++        bool header = false;
++        for( auto *pKF : seen ) {
++            Sophus::SE3f Trw;
++            ORB_SLAM3::KeyFrame *p = pKF;
++            for( int guard = 0 ; p->isBad() && p->GetParent() && guard < 10000 ; guard++ ) {
++                Trw = Trw * p->mTcp;
++                p = p->GetParent();
++            }
++            Sophus::SE3f Twc = (Trw * p->GetPose()).inverse();
++            auto it = last.find(pKF);
++            if( it != last.end() && (Twc.matrix() - it->second.matrix()).cwiseAbs().maxCoeff() < 1e-7 ) continue;
++            if( !header ) { fbel << "S " << std::fixed << std::setprecision(6) << times[i] << "\n"; header = true; }
++            writePose(fbel, pKF->mTimeStamp, Twc, p->GetMap() ? p->GetMap()->GetId() : 0);
++            last[pKF] = Twc;
++        }
++        double ttrack = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
++        double T = i + 1 < files.size() ? times[i + 1] - times[i] : (i > 0 ? times[i] - times[i - 1] : 0);
++        if( ttrack < T )
++            std::this_thread::sleep_for(std::chrono::duration<double>(T - ttrack));
++    }
++    double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
++    SLAM.Shutdown();
++    flive.close();
++
++    std::ofstream fkf(out + "_kfs.txt");
++    auto maps = SLAM.GetAtlas()->GetAllMaps();
++    for( auto *pMap : maps ) {
++        for( auto *pKF : pMap->GetAllKeyFrames() ) {
++            if( pKF->isBad() ) continue;
++            writePose(fkf, pKF->mTimeStamp, pKF->GetPoseInverse(), pMap->GetId());
++        }
++    }
++    std::ofstream(out + "_info.txt") << "frames=" << files.size() << "\nseconds=" << wall << "\nmaps=" << maps.size() << "\n";
++    return 0;
++}
+diff --git a/build.sh b/build.sh
+index 96d1c09..7d2e326 100755
+--- a/build.sh
++++ b/build.sh
+@@ -4,7 +4,7 @@ cd Thirdparty/DBoW2
+ mkdir build
+ cd build
+ cmake .. -DCMAKE_BUILD_TYPE=Release
+-make -j
++make -j32
+ 
+ cd ../../g2o
+ 
+@@ -13,7 +13,7 @@ echo "Configuring and building Thirdparty/g2o ..."
+ mkdir build
+ cd build
+ cmake .. -DCMAKE_BUILD_TYPE=Release
+-make -j
++make -j32
+ 
+ cd ../../Sophus
+ 
+@@ -22,7 +22,7 @@ echo "Configuring and building Thirdparty/Sophus ..."
+ mkdir build
+ cd build
+ cmake .. -DCMAKE_BUILD_TYPE=Release
+-make -j
++make -j32
+ 
+ cd ../../../
+ 
+@@ -37,4 +37,4 @@ echo "Configuring and building ORB_SLAM3 ..."
+ mkdir build
+ cd build
+ cmake .. -DCMAKE_BUILD_TYPE=Release
+-make -j4
++make -j32
+diff --git a/include/System.h b/include/System.h
+index 872c86e..c848110 100644
+--- a/include/System.h
++++ b/include/System.h
+@@ -174,6 +174,7 @@ public:
+     // Information from most recent processed frame
+     // You can call this right after TrackMonocular (or stereo or RGBD)
+     int GetTrackingState();
++    Atlas* GetAtlas() { return mpAtlas; }  // bench: keyframes of all maps
+     std::vector<MapPoint*> GetTrackedMapPoints();
+     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
+ 

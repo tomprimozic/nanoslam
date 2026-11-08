@@ -173,8 +173,9 @@ class EuRoC(Dataset):
   '''a directory with mav0/, or the zip archive of the sequence (as downloaded)'''
   def __init__(self, path: Path):
     self.name = path.name.removesuffix('.zip')
-    src = Source(path) if path.suffix == '.zip' else Source(path)
+    src = Source(path)
     cam = yaml.safe_load(src.text('mav0/cam0/sensor.yaml'))
+    self.camera = cam       # (raw calibration: for systems that undistort themselves)
     images = src.table('mav0/cam0/data.csv')
     gt = src.table('mav0/state_groundtruth_estimate0/data.csv').to_numpy()
     t_img = images.iloc[:, 0].to_numpy()
@@ -248,23 +249,60 @@ class MonoVO(Dataset):
     lines = (path / 'camera.txt').read_text().split('\n')
     fx, fy, cx, cy, w = map(float, lines[0].split()[:5])
     in_w, in_h = map(int, lines[1].split())
-    ox, oy, ocx, ocy = map(float, lines[2].split()[:4])
     self.width, self.height = map(int, lines[3].split())
     # relative calibration, first pixel centre at (0.5, 0.5) (DSO's convention)
     fx, fy, cx, cy = fx * in_w, fy * in_h, cx * in_w - 0.5, cy * in_h - 0.5
-    self.K = make_K(ox * self.width, oy * self.height, ocx * self.width - 0.5, ocy * self.height - 0.5)
+
+    def distort(x, y):
+      r = np.sqrt(x * x + y * y)
+      factor = np.where(r > 1e-8, np.arctan(2 * r * np.tan(w / 2)) / (w * np.maximum(r, 1e-8)), 2 * np.tan(w / 2) / w)
+      return fx * x * factor + cx, fy * y * factor + cy
+
+    if lines[2].split()[0] == 'crop':
+      self.K = self.crop_K(distort, in_w, in_h)
+    else:
+      ox, oy, ocx, ocy = map(float, lines[2].split()[:4])
+      self.K = make_K(ox * self.width, oy * self.height, ocx * self.width - 0.5, ocy * self.height - 0.5)
     u, v = np.meshgrid(np.arange(self.width, dtype=np.float64), np.arange(self.height, dtype=np.float64))
-    x, y = (u - self.K[0, 2]) / self.K[0, 0], (v - self.K[1, 2]) / self.K[1, 1]
-    r = np.sqrt(x * x + y * y)
-    factor = np.where(r > 1e-8, np.arctan(2 * r * np.tan(w / 2)) / (w * np.maximum(r, 1e-8)), 2 * np.tan(w / 2) / w)
-    map_x, map_y = (fx * x * factor + cx).astype(np.float32), (fy * y * factor + cy).astype(np.float32)
-    self.maps = cv2.convertMaps(map_x, map_y, cv2.CV_16SC2)
+    map_x, map_y = distort((u - self.K[0, 2]) / self.K[0, 0], (v - self.K[1, 2]) / self.K[1, 1])
+    self.maps = cv2.convertMaps(map_x.astype(np.float32), map_y.astype(np.float32), cv2.CV_16SC2)
     names = sorted(n for n in _zip(path / 'images.zip').namelist() if n.endswith(('.jpg', '.png')))
     self.files = [ZipMember(path / 'images.zip', n) for n in names]
     times = np.loadtxt(path / 'times.txt', usecols=1)
     self.timestamps = times[:len(self.files)]
     gt = np.genfromtxt(path / 'groundtruthSync.txt')        # (time tx ty tz qx qy qz qw, NaN where none)
     self.gt = poses_from(gt[:len(self.files), 1:8])
+
+  def crop_K(self, distort, in_w, in_h):
+    '''DSO's "crop" output calibration (Undistort::makeOptimalK_crop): the largest undistorted rectangle whose border
+    maps inside the input image'''
+    w, h = self.width, self.height
+    inside_x = lambda px: (px > 0) & (px < in_w - 1)
+    inside_y = lambda py: (py > 0) & (py < in_h - 1)
+    t = (np.arange(100000) - 50000.0) / 10000.0
+    ok = np.flatnonzero(inside_x(distort(t, np.zeros_like(t))[0]))
+    min_x, max_x = t[ok[0]] * 1.01, t[ok[-1]] * 1.01
+    ok = np.flatnonzero(inside_y(distort(np.zeros_like(t), t)[1]))
+    min_y, max_y = t[ok[0]] * 1.01, t[ok[-1]] * 1.01
+    for _ in range(500):
+      ys, xs = np.linspace(min_y, max_y, h), np.linspace(min_x, max_x, w)
+      left = not inside_x(distort(np.full(h, min_x), ys)[0]).all()
+      right = not inside_x(distort(np.full(h, max_x), ys)[0]).all()
+      top = not inside_y(distort(xs, np.full(w, min_y))[1]).all()
+      bottom = not inside_y(distort(xs, np.full(w, max_y))[1]).all()
+      if not (left or right or top or bottom):
+        break
+      if (left or right) and (top or bottom):     # shrink only the wider dimension
+        if max_x - min_x > max_y - min_y:
+          top = bottom = False
+        else:
+          left = right = False
+      min_x, max_x = min_x * (0.995 if left else 1), max_x * (0.995 if right else 1)
+      min_y, max_y = min_y * (0.995 if top else 1), max_y * (0.995 if bottom else 1)
+    else:
+      raise ValueError('no valid crop calibration')
+    fx, fy = (w - 1) / (max_x - min_x), (h - 1) / (max_y - min_y)
+    return make_K(fx, fy, -min_x * fx, -min_y * fy)
 
 
 class ETH3D(Dataset):
