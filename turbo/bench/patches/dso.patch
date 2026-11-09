@@ -64,15 +64,16 @@ index 170cb33..685eb72 100644
  		printf("cv::imdecode could not read stream (%d bytes)! this may segfault. \n", numBytes);
 diff --git a/src/main_bench.cpp b/src/main_bench.cpp
 new file mode 100644
-index 0000000..8482f93
+index 0000000..9127ebc
 --- /dev/null
 +++ b/src/main_bench.cpp
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,176 @@
 +// Monocular benchmark driver (shared by the slambench comparison), without GUI.
 +//
-+//   dso_bench calib.txt frames.txt out_prefix
++//   dso_bench calib.txt frames.txt out_prefix [pcalib.txt vignette.png]
 +//
-+// frames.txt: "timestamp image_path" per line. No photometric calibration (mode=1), preset 0 (default settings, not
++// frames.txt: "timestamp image_path [exposure_ms]" per line. Without pcalib / vignette: no photometric calibration
++// (mode=1); with them: mode=0 (photometric calibration, exposure times from frames.txt). Preset 0 (default settings, not
 +// enforcing real time: mapping runs synchronously, as in DSO's own non-realtime runs). Like the original driver,
 +// resets while initializing (first 250 frames) and stops when lost. Writes
 +//   <out_prefix>_live.txt  pose of every tracked frame as estimated at that frame (TUM format, T_wc)
@@ -126,14 +127,17 @@ index 0000000..8482f93
 +
 +int main(int argc, char** argv)
 +{
-+    if( argc != 4 ) {
-+        std::cerr << "usage: dso_bench calib.txt frames.txt out_prefix\n";
++    if( argc != 4 && argc != 6 ) {
++        std::cerr << "usage: dso_bench calib.txt frames.txt out_prefix [pcalib.txt vignette.png]\n";
 +        return 1;
 +    }
-+    // mode=1 (no photometric calibration), preset=0, quiet
-+    setting_photometricCalibration = 0;
-+    setting_affineOptModeA = 0;
-+    setting_affineOptModeB = 0;
++    const bool photometric = argc == 6;
++    if( !photometric ) {    // mode=1 (no photometric calibration); mode=0 keeps DSO's defaults
++        setting_photometricCalibration = 0;
++        setting_affineOptModeA = 0;
++        setting_affineOptModeB = 0;
++    }
++    // preset=0, quiet
 +    setting_desiredImmatureDensity = 1500;
 +    setting_desiredPointDensity = 2000;
 +    setting_minFrames = 5;
@@ -145,6 +149,7 @@ index 0000000..8482f93
 +    disableAllDisplay = true;
 +
 +    std::vector<double> times;
++    std::vector<float> exposures;
 +    std::vector<std::string> files;
 +    {
 +        std::ifstream f(argv[2]);
@@ -152,22 +157,29 @@ index 0000000..8482f93
 +        while( std::getline(f, line) ) {
 +            if( line.empty() || line[0] == '#' ) continue;
 +            std::istringstream ss(line);
-+            double t; std::string fn;
++            double t; std::string fn; float exposure = 1.0f;
 +            ss >> t >> fn;
++            if( !(ss >> exposure) ) exposure = 1.0f;
 +            times.push_back(t);
++            exposures.push_back(exposure);
 +            files.push_back(fn);
 +        }
 +    }
 +    const std::string out = argv[3];
 +
-+    Undistort* undistort = Undistort::getUndistorterForFile(argv[1], "", "");
++    Undistort* undistort = Undistort::getUndistorterForFile(argv[1], photometric ? argv[4] : "", photometric ? argv[5] : "");
++    float* gamma = (undistort->photometricUndist != 0) ? undistort->photometricUndist->getG() : 0;
++    if( photometric && gamma == 0 ) {
++        std::cerr << "cannot load the photometric calibration\n";
++        return 1;
++    }
 +    Eigen::Matrix3f K = undistort->getK().cast<float>();
 +    setGlobalCalib(undistort->getSize()[0], undistort->getSize()[1], K);
 +
 +    Recorder* rec = new Recorder();
 +    rec->live.open(out + "_live.txt");
 +    FullSystem* fullSystem = new FullSystem();
-+    fullSystem->setGammaFunction(0);
++    fullSystem->setGammaFunction(gamma);
 +    fullSystem->linearizeOperation = true;
 +    fullSystem->outputWrapper.push_back(rec);
 +
@@ -186,7 +198,7 @@ index 0000000..8482f93
 +            std::cerr << "cannot read " << files[i] << ", frame skipped\n";
 +            continue;
 +        }
-+        ImageAndExposure* img = undistort->undistort<unsigned char>(minimg, 1.0f, times[i]);
++        ImageAndExposure* img = undistort->undistort<unsigned char>(minimg, exposures[i], times[i]);
 +        delete minimg;
 +        fullSystem->addActiveFrame(img, i);
 +        delete img;
@@ -197,7 +209,7 @@ index 0000000..8482f93
 +                for( IOWrap::Output3DWrapper* ow : wraps ) ow->reset();
 +                last.clear();     // (the shells of the old system are gone)
 +                fullSystem = new FullSystem();
-+                fullSystem->setGammaFunction(0);
++                fullSystem->setGammaFunction(gamma);
 +                fullSystem->linearizeOperation = true;
 +                fullSystem->outputWrapper = wraps;
 +                setting_fullResetRequested = false;

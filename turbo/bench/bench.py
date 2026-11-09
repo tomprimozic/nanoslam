@@ -144,6 +144,24 @@ def setup_dso(data, start, d):
   return [str(LIB / 'dso/build/bin/dso_bench'), str(d / 'camera.txt'), str(d / 'frames.txt'), str(d / 'raw')]
 
 
+
+def setup_dso_photo(data, start, d):
+  '''
+  DSO as in its paper on TUM monoVO: the raw images with the dataset's own calibration (FOV model, undistorted by DSO),
+  photometric calibration (response, vignetting) and exposure times (mode=0). Other datasets have no photometric
+  calibration: as setup_dso
+  '''
+  if not isinstance(data, datasets.MonoVO):
+    return setup_dso(data, start, d)
+  seq = data.files[0].archive.parent
+  files = image_files(data, 'raw')
+  exposure = np.loadtxt(seq / 'times.txt', usecols=2)
+  with open(d / 'frames.txt', 'w') as f:
+    for i in range(start, len(data)):
+      f.write(f'{data.timestamps[i]:.9f} {files[i]} {exposure[i]}\n')
+  return [str(LIB / 'dso/build/bin/dso_bench'), str(seq / 'camera.txt'), str(d / 'frames.txt'), str(d / 'raw'),
+          str(seq / 'pcalib.txt'), str(seq / 'vignette.png')]
+
 def setup_ov2slam(loop):
   def setup(data, start, d):
     kind, K, dist = camera(data)
@@ -174,6 +192,7 @@ SYSTEMS = {
   'orbslam2_vo': setup_orb(2, loop=False),
   'orbslam3': setup_orb(3),
   'dso': setup_dso,
+  'dso_photo': setup_dso_photo,
   'ov2slam': setup_ov2slam(loop=True),
   'ov2slam_vo': setup_ov2slam(loop=False),
 }

@@ -9,7 +9,7 @@ import argparse
 import json
 from pathlib import Path
 
-ORDER = ['turbo', 'orbslam2', 'orbslam2_vo', 'orbslam3', 'dso', 'ov2slam', 'ov2slam_vo']
+ORDER = ['turbo', 'orbslam2', 'orbslam2_vo', 'orbslam3', 'dso', 'dso_photo', 'ov2slam', 'ov2slam_vo']
 FAMILIES = [('MH_', 'EuRoC'), ('V1_', 'EuRoC'), ('V2_', 'EuRoC'), ('freiburg1', 'TUM fr1'), ('freiburg2', 'TUM fr2/3'),
             ('freiburg3', 'TUM fr2/3'), ('icl', 'ICL-NUIM / ETH3D'), ('eth3d', 'ICL-NUIM / ETH3D'),
             ('tartanair', 'TartanAir'), ('abandoned', 'TartanAir'), ('hospital', 'TartanAir'), ('KITTI', 'KITTI'),
