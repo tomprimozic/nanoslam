@@ -116,13 +116,15 @@ def orb_settings(data, version, K, dist, d):
   return d / 'orb.yaml'
 
 
-def setup_orb(version):
+def setup_orb(version, loop=True):
   def setup(data, start, d):
     kind, K, dist = camera(data)
     frames_file(data, image_files(data, kind), start, d / 'frames.txt')
     exe = LIB / f'ORB_SLAM{version}/Examples/Monocular/mono_bench'
     voc = LIB / f'ORB_SLAM{version}/Vocabulary/ORBvoc.txt'
-    return [str(exe), str(voc), str(orb_settings(data, version, K, dist, d)), str(d / 'frames.txt'), str(d / 'raw')]
+    cmd = [str(exe), str(voc), str(orb_settings(data, version, K, dist, d)), str(d / 'frames.txt'), str(d / 'raw')]
+    # without loop closing: loop detection switched off in the bench patch (relocalization still uses the keyframe database)
+    return cmd if loop else ['env', f'ORB_SLAM{version}_NO_LOOP=1'] + cmd
   return setup
 
 
@@ -169,6 +171,7 @@ def setup_ov2slam(loop):
 
 SYSTEMS = {
   'orbslam2': setup_orb(2),
+  'orbslam2_vo': setup_orb(2, loop=False),
   'orbslam3': setup_orb(3),
   'dso': setup_dso,
   'ov2slam': setup_ov2slam(loop=True),

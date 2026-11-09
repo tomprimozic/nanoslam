@@ -392,6 +392,21 @@ index 6094b8f..00aaee5 100644
  #include "Initializer.h"
  
  #include "Thirdparty/DBoW2/DUtils/Random.h"
+diff --git a/src/LoopClosing.cc b/src/LoopClosing.cc
+index 5e317dd..e70c9fa 100644
+--- a/src/LoopClosing.cc
++++ b/src/LoopClosing.cc
+@@ -111,7 +111,9 @@ bool LoopClosing::DetectLoop()
+     }
+ 
+     //If the map contains less than 10 KF or less than 10 KF have passed from last loop detection
+-    if(mpCurrentKF->mnId<mLastLoopKFid+10)
++    // ORB_SLAM2_NO_LOOP=1 (benchmark): never detect loops (keyframes still go to the database for relocalization)
++    static const bool noLoop = getenv("ORB_SLAM2_NO_LOOP") != nullptr;
++    if(noLoop || mpCurrentKF->mnId<mLastLoopKFid+10)
+     {
+         mpKeyFrameDB->add(mpCurrentKF);
+         mpCurrentKF->SetErase();
 diff --git a/src/ORBextractor.cc b/src/ORBextractor.cc
 index 14be2ef..1ac69d3 100644
 --- a/src/ORBextractor.cc
