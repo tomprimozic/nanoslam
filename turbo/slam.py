@@ -39,7 +39,7 @@ class Config:
   phase_min_correction = 2.0        # px, only correct the prediction by larger differences
 
   # detection: the strongest min-eigenvalue corner of every empty grid cell
-  cells = 20                        # across the image width
+  cells = 20                        # across the width of a 4:3 image of the same area (wide images get as many cells)
   min_quality = 0.001               # relative to the strongest corner
   detect_blur = True                # 3x3 blur before the corner score (OV2SLAM)
 
@@ -285,7 +285,7 @@ class SLAM:
     '''the strongest min-eigenvalue corner of every grid cell without a track'''
     c = self.c
     h, w = img.shape
-    cell = int(np.ceil(w / c.cells))
+    cell = int(np.ceil(np.sqrt(w * h * 4 / 3) / c.cells))     # (= w / cells for 4:3 images)
     ny, nx = -(-h // cell), -(-w // cell)
     occupied = np.zeros((ny, nx), bool)
     uv = tracked.astype(int)
